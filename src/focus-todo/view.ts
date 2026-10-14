@@ -33,7 +33,7 @@ export const MAX_DONE_ROWS = 16
 export const MAX_ROWS = MAX_OPEN_ROWS + MAX_DONE_ROWS
 
 /** Never emit a row wider than this many terminal columns. */
-export const MAX_ROW_WIDTH = 30
+export const MAX_ROW_WIDTH = 60
 
 /** How far back to look for the newest tool result; bounds the per-render cost. */
 export const MESSAGE_SCAN_LIMIT = 60
@@ -64,14 +64,20 @@ export interface Panel {
   readonly rows: readonly PanelRow[]
 }
 
-/** Marker per status, kept identical to what the model sees in the tool result. */
-const MARK: Record<ViewStatus, string> = { in_progress: ">", pending: "-", blocked: "!", done: "x" }
+/** Mark the parser accepts, kept identical to what the model sees in the tool result. */
 const STATUS_BY_MARK: Record<string, ViewStatus> = {
   ">": "in_progress",
   "-": "pending",
   "!": "blocked",
   x: "done",
 }
+
+/**
+ * What the panel draws instead of the tool result's compact letter marks: a
+ * scannable status column — ▶ running, ○ open, ! blocked, ✓ finished. Display
+ * only; the parser above still reads the letter marks the server prints.
+ */
+export const DISPLAY_MARK: Record<ViewStatus, string> = { in_progress: "▶", pending: "○", blocked: "!", done: "✓" }
 
 /** `formatState` header: `"3 active, done=2"`. */
 const HEADER = /^(\d{1,4}) active, done=(\d{1,6})$/
@@ -230,7 +236,7 @@ export function buildPanel(view: FocusView | undefined, width: number = MAX_ROW_
   const rowsOf = (items: readonly ViewItem[]): PanelRow[] =>
     items.slice(0, MAX_ROWS).map((item) => ({
       status: item.status,
-      line: clip(`${item.id}:${MARK[item.status]} ${item.text}`, width),
+      line: clip(`${DISPLAY_MARK[item.status]} ${item.id} ${item.text}`, width),
     }))
 
   if (view === undefined || (view.active === 0 && view.done === 0)) {

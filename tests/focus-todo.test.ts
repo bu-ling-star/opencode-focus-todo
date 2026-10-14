@@ -17,6 +17,7 @@ import focusTodoPlugin, {
   INPUT_SCHEMA,
   KEY_PREFIX,
   MAX_ITEMS,
+  MAX_BATCH_OPS,
   MAX_TEXT,
   normalizeState,
   OUTPUT_SCHEMA,
@@ -169,19 +170,27 @@ describe("applyAction", () => {
     expect(applyAction(added.state, { action: "update", id: "t1" })).toEqual({ ok: false, error: "nothing to update" })
   })
 
-  test("complete marks the item instead of deleting it, and advances the done counter", () => {
+  test("update with done:true marks the item instead of deleting it, and advances the done counter", () => {
     const added = applyAction(emptyState(), { action: "add", text: "a" })
     if (!added.ok) throw new Error("setup failed")
-    const completed = applyAction(added.state, { action: "complete", id: "t1" })
+    const completed = applyAction(added.state, { action: "update", id: "t1", done: true })
     expect(completed.ok && completed.state.items).toEqual([{ id: "t1", text: "a", status: "pending", done: true }])
     expect(completed.ok && completed.state.completed).toBe(1)
     // The model sees the count and a marked row, never the row's full text again.
     expect(completed.ok && completed.text).toBe("0 active, done=1\nt1:x a")
 
-    // Completing twice is refused, naming what is still open.
-    expect(applyAction(completed.ok ? completed.state : emptyState(), { action: "complete", id: "t1" })).toEqual({
+    // Marking twice is refused, naming what is still open.
+    expect(applyAction(completed.ok ? completed.state : emptyState(), { action: "update", id: "t1", done: true })).toEqual({
       ok: false,
       error: "t1 is already done; open ids: none",
+    })
+
+    // `done` is not a toggle: only `true` is supported.
+    const second = applyAction(emptyState(), { action: "add", text: "b" })
+    if (!second.ok) throw new Error("setup failed")
+    expect(applyAction(second.state, { action: "update", id: "t1", done: false } as unknown as FocusTodoInput)).toEqual({
+      ok: false,
+      error: "done only supports true",
     })
   })
 
@@ -191,8 +200,8 @@ describe("applyAction", () => {
       items: [{ text: "running", status: "in_progress" }, { text: "later" }],
     })
     if (!seeded.ok) throw new Error("setup failed")
-    const completed = applyAction(seeded.state, { action: "complete", id: "t1" })
-    if (!completed.ok) throw new Error("complete failed")
+    const completed = applyAction(seeded.state, { action: "update", id: "t1", done: true })
+    if (!completed.ok) throw new Error("mark failed")
 
     // t1 is marked, so a new in_progress is allowed even though t1 still says in_progress.
     expect(applyAction(completed.state, { action: "update", id: "t2", status: "in_progress" }).ok).toBe(true)
@@ -207,8 +216,8 @@ describe("applyAction", () => {
     for (let index = 0; index < MAX_DONE + 3; index += 1) {
       const added = applyAction(state, { action: "add", text: `task ${index}` })
       if (!added.ok) throw new Error("add failed")
-      const completed = applyAction(added.state, { action: "complete", id: `t${index + 1}` })
-      if (!completed.ok) throw new Error("complete failed")
+      const completed = applyAction(added.state, { action: "update", id: `t${index + 1}`, done: true })
+      if (!completed.ok) throw new Error("mark failed")
       state = completed.state
     }
     const marked = state.items.filter((item) => item.done === true)
@@ -226,20 +235,20 @@ describe("applyAction", () => {
     if (!added.ok) throw new Error("setup failed")
     const second = applyAction(added.state, { action: "add", text: "second" })
     if (!second.ok) throw new Error("setup failed")
-    const addFlow = applyAction(second.state, { action: "complete", id: "t1" })
-    if (!addFlow.ok) throw new Error("complete failed")
-    const addFlowDone = applyAction(addFlow.state, { action: "complete", id: "t2" })
-    if (!addFlowDone.ok) throw new Error("complete failed")
+    const addFlow = applyAction(second.state, { action: "update", id: "t1", done: true })
+    if (!addFlow.ok) throw new Error("mark failed")
+    const addFlowDone = applyAction(addFlow.state, { action: "update", id: "t2", done: true })
+    if (!addFlowDone.ok) throw new Error("mark failed")
 
     const replaced = applyAction(emptyState(), {
       action: "replace",
       items: [{ text: "first" }, { text: "second" }],
     })
     if (!replaced.ok) throw new Error("setup failed")
-    const replaceFlow = applyAction(replaced.state, { action: "complete", id: "t1" })
-    if (!replaceFlow.ok) throw new Error("complete failed")
-    const replaceFlowDone = applyAction(replaceFlow.state, { action: "complete", id: "t2" })
-    if (!replaceFlowDone.ok) throw new Error("complete failed")
+    const replaceFlow = applyAction(replaced.state, { action: "update", id: "t1", done: true })
+    if (!replaceFlow.ok) throw new Error("mark failed")
+    const replaceFlowDone = applyAction(replaceFlow.state, { action: "update", id: "t2", done: true })
+    if (!replaceFlowDone.ok) throw new Error("mark failed")
 
     expect(addFlowDone.text).toBe("0 active, done=2\nt2:x second\nt1:x first")
     expect(replaceFlowDone.text).toBe(addFlowDone.text)
@@ -251,8 +260,8 @@ describe("applyAction", () => {
       items: [{ text: "first", status: "in_progress" }, { text: "second" }],
     })
     if (!seeded.ok) throw new Error("setup failed")
-    const completed = applyAction(seeded.state, { action: "complete", id: "t1" })
-    if (!completed.ok) throw new Error("complete failed")
+    const completed = applyAction(seeded.state, { action: "update", id: "t1", done: true })
+    if (!completed.ok) throw new Error("mark failed")
     expect(completed.ok && completed.text).toBe("1 active, done=1\nt2:- second\nt1:x first")
 
     const replanned = applyAction(completed.state, {
@@ -269,13 +278,22 @@ describe("applyAction", () => {
   test("replace with an empty list clears the marks as well as the open items", () => {
     const added = applyAction(emptyState(), { action: "add", text: "first" })
     if (!added.ok) throw new Error("setup failed")
-    const completed = applyAction(added.state, { action: "complete", id: "t1" })
-    if (!completed.ok) throw new Error("complete failed")
+    const completed = applyAction(added.state, { action: "update", id: "t1", done: true })
+    if (!completed.ok) throw new Error("setup failed")
+    const careless = applyAction(completed.state, { action: "add", text: "b" })
+    if (!careless.ok) throw new Error("setup failed")
 
-    const emptied = applyAction(completed.state, { action: "replace", items: [] })
+    const emptied = applyAction(careless.state, { action: "replace", items: [] })
     expect(emptied.ok && emptied.state.items).toEqual([])
     expect(emptied.ok && emptied.state.completed).toBe(0)
     expect(emptied.ok && emptied.text).toBe("0 active, done=0")
+
+    // A cleared session reads exactly like one that never used the tool: the panel falls
+    // back to `暂无待办`, and the next plan starts its own count from zero — while the id
+    // sequence keeps going (t3, never reused).
+    expect(emptied.ok && emptied.state.nextId).toBe(3)
+    const next = applyAction(emptied.ok ? emptied.state : emptyState(), { action: "add", text: "c" })
+    expect(next.ok && next.text).toBe("1 active, done=0\nt3:- c")
   })
 
   test("remove drops the item without counting it as done", () => {
@@ -291,8 +309,8 @@ describe("applyAction", () => {
       items: [{ text: "first" }, { text: "second" }],
     })
     if (!seeded.ok) throw new Error("setup failed")
-    const completed = applyAction(seeded.state, { action: "complete", id: "t1" })
-    if (!completed.ok) throw new Error("complete failed")
+    const completed = applyAction(seeded.state, { action: "update", id: "t1", done: true })
+    if (!completed.ok) throw new Error("mark failed")
 
     const removed = applyAction(completed.state, { action: "remove", id: "t1" })
     expect(removed.ok && removed.state.items).toEqual([{ id: "t2", text: "second", status: "pending" }])
@@ -300,28 +318,11 @@ describe("applyAction", () => {
     expect(removed.ok && removed.state.completed).toBe(1)
   })
 
-  test("clear drops open items, marked rows and the done counter, keeping the id sequence", () => {
-    const added = applyAction(emptyState(), { action: "add", text: "a" })
-    if (!added.ok) throw new Error("setup failed")
-    const completed = applyAction(added.state, { action: "complete", id: "t1" })
-    if (!completed.ok) throw new Error("setup failed")
-    const careless = applyAction(completed.state, { action: "add", text: "b" })
-    if (!careless.ok) throw new Error("setup failed")
-    const cleared = applyAction(careless.state, { action: "clear" })
-    // A cleared session reads exactly like one that never used the tool: the panel falls
-    // back to `暂无待办`, and the next plan starts its own count from zero.
-    expect(cleared.ok && cleared.state).toMatchObject({ items: [], completed: 0, nextId: 3 })
-    expect(cleared.ok && cleared.text).toBe("0 active, done=0")
-
-    const next = applyAction(cleared.ok ? cleared.state : emptyState(), { action: "add", text: "c" })
-    expect(next.ok && next.text).toBe("1 active, done=0\nt3:- c")
-  })
-
   test("a cleared or replanned counter stays zero through the store round-trip", async () => {
     const { run } = core()
     await run(SESSION, { action: "replace", items: [{ text: "a" }, { text: "b" }] })
-    await run(SESSION, { action: "complete", id: "t1" })
-    expect(await run(SESSION, { action: "clear" })).toBe("0 active, done=0")
+    await run(SESSION, { action: "update", id: "t1", done: true })
+    expect(await run(SESSION, { action: "replace", items: [] })).toBe("0 active, done=0")
     // Reloading from the store must not "repair" the reset back: there are no marked rows
     // left to raise it to, which is exactly the case the upward repair must leave alone.
     expect(await list(run)).toBe("0 active, done=0")
@@ -329,7 +330,7 @@ describe("applyAction", () => {
     const { data, storage } = memoryStorage()
     const first = createFocusTodo(storage, undefined)
     await first.run(SESSION, { action: "replace", items: [{ text: "a" }] })
-    await first.run(SESSION, { action: "complete", id: "t1" })
+    await first.run(SESSION, { action: "update", id: "t1", done: true })
     await first.run(SESSION, { action: "replace", items: [{ text: "b" }] })
     const restarted = createFocusTodo(storage, undefined)
     expect(await list(restarted.run)).toBe("1 active, done=0\nt2:- b")
@@ -383,9 +384,9 @@ describe("applyAction", () => {
     ).toEqual({ ok: false, error: `too many items (max ${MAX_ITEMS})` })
   })
 
-  test("unknown ids are rejected for update, complete and remove", () => {
-    for (const action of ["update", "complete", "remove"] as const) {
-      const input = action === "update" ? { action, id: "t9", text: "x" } : { action, id: "t9" }
+  test("unknown ids are rejected for update and remove", () => {
+    for (const action of ["update", "remove"] as const) {
+      const input = action === "update" ? { action, id: "t9", done: true as const } : { action, id: "t9" }
       expect(applyAction(emptyState(), input as FocusTodoInput)).toEqual({
         ok: false,
         error: "unknown id t9; nothing is open",
@@ -398,7 +399,7 @@ describe("applyAction", () => {
     if (!seeded.ok) throw new Error("setup failed")
     const second = applyAction(seeded.state, { action: "add", text: "and this" })
     if (!second.ok) throw new Error("setup failed")
-    expect(applyAction(second.state, { action: "complete", id: "t17" })).toEqual({
+    expect(applyAction(second.state, { action: "update", id: "t17", done: true })).toEqual({
       ok: false,
       error: "unknown id t17; open ids: t1 t2",
     })
@@ -444,7 +445,7 @@ describe("applyAction", () => {
   test("unknown actions are rejected", () => {
     expect(applyAction(emptyState(), { action: "purge" } as never)).toEqual({
       ok: false,
-      error: "unknown action (use list|replace|add|update|complete|remove|clear)",
+      error: "unknown action (use list|replace|add|update|remove|batch)",
     })
   })
 
@@ -455,6 +456,108 @@ describe("applyAction", () => {
     expect(outcome.text).not.toContain("version")
     expect(outcome.text).not.toContain("nextId")
     expect(outcome.text).toBe("1 active, done=0\nt1:- secret plan")
+  })
+
+  test("batch applies ops in order and reports only the final state", () => {
+    const outcome = applyAction(emptyState(), {
+      action: "batch",
+      ops: [
+        { action: "add", text: "read the spec" },
+        { action: "add", text: "implement storage", status: "in_progress" },
+        { action: "add", text: "write tests" },
+        { action: "update", id: "t1", done: true },
+      ],
+    })
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    // Same shape as any single mutation: the newest focus_todo result parse and
+    // the reminder's dedup guard do not care how the state was reached.
+    expect(outcome.text).toBe("2 active, done=1\nt2:> implement storage\nt3:- write tests\nt1:x read the spec")
+    expect(outcome.write).toBe(true)
+    expect(outcome.state.completed).toBe(1)
+    expect(outcome.state.nextId).toBe(4)
+  })
+
+  test("batch is atomic: one bad op rejects the whole batch", () => {
+    const seeded = applyAction(emptyState(), { action: "add", text: "already here" })
+    if (!seeded.ok) throw new Error("setup failed")
+
+    const outcome = applyAction(seeded.state, {
+      action: "batch",
+      ops: [
+        { action: "add", text: "fine" },
+        { action: "update", id: "t9", done: true }, // unknown id
+      ],
+    })
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    // The failure names the op, the reason, and the ids that do exist — one retry
+    // can fix everything without a separate list call. Later ops are evaluated on
+    // the draft that earlier successful ops produced, so the ids listed here
+    // include the one op 1 just added.
+    expect(outcome.error).toBe("batch rejected, 1 of 2 ops failed: op 2: unknown id t9; open ids: t1 t2")
+  })
+
+  test("batch reports every failing op at once", () => {
+    const outcome = applyAction(emptyState(), {
+      action: "batch",
+      ops: [
+        { action: "update", id: "t7", done: true },
+        "not an object" as never,
+        { action: "replace", items: [] }, // fine, but the two failures still reject the batch
+        { action: "update", id: "t1", text: "x" },
+      ],
+    })
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toContain("3 of 4 ops failed")
+    expect(outcome.error).toContain("op 1: unknown id t7")
+    expect(outcome.error).toContain("op 2: must be an object")
+    expect(outcome.error).toContain("op 4: unknown id t1")
+  })
+
+  test("batch error lists are capped at four with a counted remainder", () => {
+    const ops = Array.from({ length: 6 }, () => ({ action: "update" as const, id: "t9", done: true as const }))
+    const outcome = applyAction(emptyState(), { action: "batch", ops })
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toContain("6 of 6 ops failed")
+    expect(outcome.error).toContain("+2 more")
+  })
+
+  test("batch validates its own envelope", () => {
+    expect(applyAction(emptyState(), { action: "batch" } as never)).toEqual({ ok: false, error: "ops must be an array" })
+    expect(applyAction(emptyState(), { action: "batch", ops: [] })).toEqual({ ok: false, error: "ops is empty" })
+    expect(
+      applyAction(emptyState(), { action: "batch", ops: Array.from({ length: MAX_BATCH_OPS + 1 }, () => ({ action: "add", text: "x" })) }),
+    ).toEqual({
+      ok: false,
+      error: "too many ops (max 24)",
+    })
+  })
+
+  test("batch rejects nested batches and list ops with a reason, not a crash", () => {
+    const outcome = applyAction(emptyState(), {
+      action: "batch",
+      ops: [
+        { action: "list" } as never,
+        { action: "batch", ops: [] } as never,
+      ],
+    })
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toContain("op 1: list is pointless inside a batch")
+    expect(outcome.error).toContain("op 2: nested batch not allowed")
+  })
+
+  test("batch ops face the same caps as single calls", () => {
+    const outcome = applyAction(emptyState(), {
+      action: "batch",
+      ops: [{ action: "replace", items: Array.from({ length: MAX_ITEMS + 1 }, (_, i) => ({ text: `x${i}` })) }],
+    })
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toContain("op 1: too many items (max 16)")
   })
 })
 
@@ -685,14 +788,15 @@ describe("plugin entrypoint", () => {
     env["XDG_CONFIG_HOME"] = "C:\\focus-todo-tests-no-config"
     // The two pins below then only spell out the intended shipped defaults.
     env["FOCUS_TODO_REMINDER"] = "1"
-    env["FOCUS_TODO_STALE_AFTER"] = "6"
+    env["FOCUS_TODO_STALE_AFTER"] = "30"
   })
 
   test("the description stays small and keeps every rule it carries", () => {
     // Size budget: the description is part of the cached prefix and is re-sent on
     // every request of every session, so growth is a product decision, not a
-    // side effect of a rewording. The current wording is ~410 characters.
-    expect(TOOL_DESCRIPTION.length).toBeLessThanOrEqual(430)
+    // side effect of a rewording. The batch rule added ~105 characters — paid
+    // once per request inside the cache, and repaid by every avoided round trip.
+    expect(TOOL_DESCRIPTION.length).toBeLessThanOrEqual(540)
 
     // Rule coverage, one marker per rule. Rewording is fine; losing a rule is not.
     expect(TOOL_DESCRIPTION).toContain('action="list"') // the resume call
@@ -702,11 +806,17 @@ describe("plugin entrypoint", () => {
     expect(TOOL_DESCRIPTION).toContain("trivial") // and skip the list for trivial ones
     expect(TOOL_DESCRIPTION).toContain("few words") // item brevity
     expect(TOOL_DESCRIPTION).toContain("in_progress")
+    expect(TOOL_DESCRIPTION).toContain('action="batch"') // one call, not repeated edits
     expect(TOOL_DESCRIPTION).toContain("not tracked") // the authority line
   })
 
   test("the schemas stay small too: they are the other half of the cached prefix", () => {
-    expect(JSON.stringify(INPUT_SCHEMA).length).toBeLessThanOrEqual(1050)
+    // The ops definition repeats the replace-item shape, which is what the batch
+    // buys: one call for a whole reshuffle instead of one call per edit. Folding
+    // `complete` into `update` (done:true) and `clear` into `replace` (empty list)
+    // removed two enum values and added the `done` flag, netting ~+130 characters —
+    // paid once inside the cache, repaid by two fewer actions for the model to pick.
+    expect(JSON.stringify(INPUT_SCHEMA).length).toBeLessThanOrEqual(2200)
     expect(JSON.stringify(OUTPUT_SCHEMA)).toBe('{"type":"string"}')
   })
 
@@ -906,8 +1016,8 @@ describe("cache prefix stability", () => {
     { action: "update", id: "t1", text: "implement storage safely" },
     { action: "update", id: "t1", status: "in_progress" },
     { action: "add", text: "add tests", status: "blocked" },
-    { action: "complete", id: "t1" },
-    { action: "clear" },
+    { action: "update", id: "t1", done: true },
+    { action: "replace", items: [] },
   ]
 
   test("tool definitions are byte-identical before and after every todo mutation", async () => {
@@ -1135,6 +1245,31 @@ describe("injectTail", () => {
     expect(await injectTail(todo, fresh)).toBe(true)
   })
 
+  test("a batch result reads exactly like any other tool result", async () => {
+    const { todo } = core()
+    const result = await todo.run(SESSION, {
+      action: "batch",
+      ops: [
+        { action: "add", text: "wire up storage", status: "in_progress" },
+        { action: "add", text: "write tests" },
+        { action: "update", id: "t2", done: true },
+      ],
+    })
+    // The result text carries the same state header, so the sidebar projection
+    // and the reminder's dedup guard need no knowledge of how it was produced.
+    expect(result).toBe("1 active, done=1\nt1:> wire up storage\nt2:x write tests")
+
+    const fresh = request([
+      user("m1", "hello"),
+      {
+        id: "m2",
+        role: "tool",
+        content: [{ type: "tool-result", toolCallId: "c1", output: { output: result } }],
+      },
+    ])
+    expect(await injectTail(todo, fresh)).toBe(false)
+  })
+
   test("honours the settings switch and the budget", async () => {
     const { todo } = core()
     await todo.run(SESSION, { action: "add", text: "wire up storage" })
@@ -1150,7 +1285,7 @@ describe("injectTail", () => {
 
   test("appends nothing when the session has nothing open and nudging is off", async () => {
     const { todo } = core()
-    await todo.run(SESSION, { action: "clear" })
+    await todo.run(SESSION, { action: "replace", items: [] })
     const payload = request([user("m1", "hi")])
     expect(await injectTail(todo, payload, { ...DEFAULT_SETTINGS, staleAfter: 0 })).toBe(false)
     expect(payload.messages.length).toBe(1)
@@ -1473,7 +1608,7 @@ describe("settings", () => {
     expect(resolveSettings(undefined, {})).toEqual(DEFAULT_SETTINGS)
     expect(DEFAULT_SETTINGS.reminder).toBe(true)
     expect(DEFAULT_SETTINGS.reminderBudget).toBe(360)
-    expect(DEFAULT_SETTINGS.staleAfter).toBe(6)
+    expect(DEFAULT_SETTINGS.staleAfter).toBe(10)
     expect(DEFAULT_SETTINGS.itemChars).toBe(48)
     expect(DEFAULT_SETTINGS.maintenanceNudge).toContain("update it")
     expect(DEFAULT_SETTINGS.creationNudge).toContain("no list yet")
@@ -1505,7 +1640,7 @@ describe("settings", () => {
     expect(resolveSettings({ staleAfter: -3 }, {}).staleAfter).toBe(0)
     expect(resolveSettings({ staleAfter: 9999 }, {}).staleAfter).toBe(200)
     expect(resolveSettings({ staleAfter: "3" }, {}).staleAfter).toBe(3)
-    expect(resolveSettings({ staleAfter: "soon" }, {}).staleAfter).toBe(6)
+    expect(resolveSettings({ staleAfter: "soon" }, {}).staleAfter).toBe(10)
   })
 
   test("clamps the item clip, and the retired invitation cap is inert", () => {

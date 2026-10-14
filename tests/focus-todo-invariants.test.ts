@@ -81,10 +81,11 @@ function randomInput(rand: () => number, state: TodoState): unknown {
 
   const roll = rand()
   if (roll < 0.12) return { action: "list" }
-  if (roll < 0.24) return { action: "clear" }
+  if (roll < 0.24) return { action: "replace", items: [] }
   if (roll < 0.4) return { action: "add", text: pickText(), status: pickStatus() }
-  if (roll < 0.55) return { action: "update", id: pickId(), text: pickText(), status: pickStatus() }
-  if (roll < 0.7) return { action: "complete", id: pickId() }
+  if (roll < 0.55)
+    return { action: "update", id: pickId(), text: pickText(), status: pickStatus(), done: rand() < 0.2 ? true : undefined }
+  if (roll < 0.7) return { action: "update", id: pickId(), done: true }
   if (roll < 0.85) return { action: "remove", id: pickId() }
   const count = Math.floor(rand() * (MAX_ITEMS + 3))
   return {

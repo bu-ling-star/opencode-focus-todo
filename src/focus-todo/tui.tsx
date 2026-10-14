@@ -32,15 +32,19 @@ import type { PanelRow, ViewStatus } from "./view.ts"
  * runtime, so this mirrors what the host actually passes to `setup`
  * (see IMPLEMENTATION_NOTES.md §6).
  */
-interface TuiTextTheme {
-  readonly base?: string
-  readonly muted?: string
-  readonly default?: string
-  readonly subdued?: string
-  readonly feedback?: {
-    readonly success?: { readonly base?: string; readonly default?: string }
-    readonly error?: { readonly base?: string; readonly default?: string }
-  }
+/**
+ * The host hands `theme.current` as a *flat* colour-keyed palette — verified
+ * against the shipped opencode-visual-cache V2 panel (`ctx.theme.current`
+ * feeding `fg`), not the nested `theme.text.*` tree the plugin types suggest.
+ */
+interface TuiTheme {
+  readonly text?: string
+  readonly textMuted?: string
+  readonly success?: string
+  readonly warning?: string
+  readonly error?: string
+  readonly primary?: string
+  readonly border?: string
 }
 
 interface TuiPanelInput {
@@ -49,7 +53,7 @@ interface TuiPanelInput {
 
 interface TuiContext {
   readonly renderer?: { readonly terminalWidth?: number }
-  readonly theme?: { readonly text?: TuiTextTheme }
+  readonly theme?: { readonly current?: TuiTheme }
   readonly data?: {
     readonly session?: {
       readonly message?: { list(sessionID: string): readonly unknown[] }
@@ -123,7 +127,7 @@ function createFold(context: TuiContext): Fold {
 }
 
 /**
- * The sidebar pane is roughly a quarter of the terminal, and the host hides it
+ * The sidebar pane is about a third of the terminal, and the host hides it
  * entirely on narrow terminals, so a share of the terminal width is a safe
  * budget. Rows are clipped to it and never wrap into extra lines.
  */
@@ -131,7 +135,7 @@ function rowWidth(terminalWidth: unknown): number {
   if (typeof terminalWidth !== "number" || !Number.isFinite(terminalWidth) || terminalWidth <= 0) {
     return MIN_ROW_WIDTH
   }
-  return Math.max(MIN_ROW_WIDTH, Math.min(MAX_ROW_WIDTH, Math.floor(terminalWidth / 4) - 2))
+  return Math.max(MIN_ROW_WIDTH, Math.min(MAX_ROW_WIDTH, Math.floor(terminalWidth / 3) - 2))
 }
 
 function pick(...values: readonly (string | undefined)[]): string | undefined {
@@ -141,19 +145,19 @@ function pick(...values: readonly (string | undefined)[]): string | undefined {
   return undefined
 }
 
-function statusColor(text: TuiTextTheme | undefined, status: ViewStatus): string | undefined {
-  const feedback = text?.feedback
+function statusColor(theme: TuiTheme | undefined, status: ViewStatus): string | undefined {
   if (status === "done") {
     // Marked rows stay visible but recede: the open work is what deserves attention.
-    return pick(text?.subdued, text?.muted, text?.default)
+    return pick(theme?.textMuted)
   }
   if (status === "in_progress") {
-    return pick(feedback?.success?.base, feedback?.success?.default, text?.base, text?.default)
+    return pick(theme?.success, theme?.text)
   }
   if (status === "blocked") {
-    return pick(feedback?.error?.base, feedback?.error?.default, text?.muted, text?.subdued)
+    return pick(theme?.error, theme?.textMuted)
   }
-  return pick(text?.muted, text?.subdued, text?.base, text?.default)
+  // Pending rows are the actionable backlog: plain text colour, brighter than done.
+  return pick(theme?.text)
 }
 
 function FocusTodoPanel(props: { readonly context: TuiContext; readonly input: TuiPanelInput }) {
@@ -181,7 +185,7 @@ function FocusTodoPanel(props: { readonly context: TuiContext; readonly input: T
   return (
     <box flexDirection="column">
       <text
-        fg={pick(props.context.theme?.text?.base, props.context.theme?.text?.default)}
+        fg={pick(props.context.theme?.current?.text)}
         truncate
         onMouseUp={() => fold.toggle()}
       >
@@ -189,13 +193,13 @@ function FocusTodoPanel(props: { readonly context: TuiContext; readonly input: T
       </text>
       <Show when={fold.open()}>
         <Show when={panel()?.status}>
-          <text fg={pick(props.context.theme?.text?.muted, props.context.theme?.text?.subdued)} truncate>
+          <text fg={pick(props.context.theme?.current?.textMuted)} truncate>
             {panel()?.status}
           </text>
         </Show>
         <For each={panel()?.rows ?? []}>
           {(row: PanelRow) => (
-            <text fg={statusColor(props.context.theme?.text, row.status)} truncate>
+            <text fg={statusColor(props.context.theme?.current, row.status)} truncate>
               {row.line}
             </text>
           )}

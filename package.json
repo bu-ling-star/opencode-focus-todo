@@ -1,6 +1,6 @@
 {
   "name": "opencode-focus-todo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Minimal persistent focus checklist for OpenCode v2 sessions: one cache-safe tool, one sidebar panel, zero dependencies.",
   "license": "MIT",

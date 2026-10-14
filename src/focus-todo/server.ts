@@ -11,8 +11,9 @@
  *   never touched; nothing is injected into the system prompt and no synthetic message is
  *   ever persisted (see `injectTail` and §9.8 of IMPLEMENTATION_NOTES.md);
  * - at most 16 open items, at most 150 chars per item, at most one `in_progress`;
- * - `complete` marks an item instead of deleting it: marked rows stay in the sidebar and in
- *   the tool result (short) but never in the per-request reminder, which stays open-only;
+ * - marking done (`update` with `done: true`) keeps the row instead of deleting it: marked
+ *   rows stay in the sidebar and in the tool result (short) but never in the per-request
+ *   reminder, which stays open-only;
  * - every failure path is soft: setup never throws, corrupt state is reset, writes are serialized.
  *
  * Zero imports by design: the module stays importable by a test runner and cannot
@@ -25,27 +26,37 @@ export interface TodoItem {
   id: string
   text: string
   status: TodoStatus
-  /** Set by `complete`: kept for the sidebar and the tool result, hidden from the reminder. */
+  /** Set by `update` with `done: true`: kept for the sidebar and the tool result, hidden from the reminder. */
   done?: boolean
 }
 
 export interface TodoState {
   version: 1
   revision: number
-  /** Completions in the *current* plan: `complete` adds one, `replace`/`clear` reset it. */
+  /** Completions in the *current* plan: a `done: true` update adds one, `replace` resets it. */
   completed: number
   nextId: number
   items: TodoItem[]
 }
 
+/**
+ * One mutation inside a `batch`. The allowed set is every mutating action minus
+ * `batch` itself — a batch is atomic, so nesting one inside another would only
+ * add a second way to say the same thing.
+ */
+export type BatchOp =
+  | { action: "replace"; items: Array<{ id?: string; text: string; status?: TodoStatus }> }
+  | { action: "add"; text: string; status?: TodoStatus }
+  | { action: "update"; id: string; text?: string; status?: TodoStatus; done?: true }
+  | { action: "remove"; id: string }
+
 export type FocusTodoInput =
   | { action: "list" }
   | { action: "replace"; items: Array<{ id?: string; text: string; status?: TodoStatus }> }
   | { action: "add"; text: string; status?: TodoStatus }
-  | { action: "update"; id: string; text?: string; status?: TodoStatus }
-  | { action: "complete"; id: string }
+  | { action: "update"; id: string; text?: string; status?: TodoStatus; done?: true }
   | { action: "remove"; id: string }
-  | { action: "clear" }
+  | { action: "batch"; ops: BatchOp[] }
 
 /** Subset of `context.storage` that this plugin relies on. */
 export interface Storage {
@@ -70,6 +81,8 @@ export const MAX_ITEMS = 16
 /** Marked items kept per session; the oldest ones are dropped once this is exceeded. */
 export const MAX_DONE = 16
 export const MAX_TEXT = 150
+/** Upper bound on one batch call: a plan holds at most 16 open items, so 24 ops covers any realistic reshuffle. */
+export const MAX_BATCH_OPS = 24
 /** Done rows appear in every tool result, so their text is clipped harder than an open item. */
 export const DONE_TEXT_MAX = 24
 export const KEY_PREFIX = "focus-todo/session/"
@@ -80,7 +93,7 @@ export const KEY_PREFIX = "focus-todo/session/"
  *   <config>/opencode/focus-todo.json      (~/.config/opencode/focus-todo.json)
  *   <plugin dir>/focus-todo.json           (fallback, next to server.ts)
  *
- * Shape: `{ "reminder": true, "reminderBudget": 360, "staleAfter": 6 }`. Missing file,
+ * Shape: `{ "reminder": true, "reminderBudget": 360, "staleAfter": 10 }`. Missing file,
  * missing key, wrong type or broken JSON all fall back to the defaults below, so the
  * plugin can never be configured into a broken state. The environment variables of the
  * same names are honoured as an override for tests and one-off runs.
@@ -107,10 +120,16 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
   reminder: true,
   reminderBudget: 360,
-  staleAfter: 6,
+  // 10 quiet requests before the next nudge, and only at a user turn start: the
+  // wire showed the nudge being read as the *user* speaking, so it fires rarely
+  // on purpose — an ignored list still re-surfaces, just at a slow cadence.
+  staleAfter: 10,
   itemChars: 48,
-  maintenanceNudge: " — update it if it changed",
-  creationNudge: '[focus_todo] no list yet — focus_todo is available if you want to record a plan',
+  // "automated" tells the model this line is the plugin speaking, not the user:
+  // the reminder rides in as a user-role message, which models otherwise read
+  // as the user asking (observed in the wild: "用户提醒我待办" in thinking).
+  maintenanceNudge: " — automated reminder, update it if it changed",
+  creationNudge: '[focus_todo] automated reminder — no list yet; focus_todo is available if you want to record a plan',
 }
 
 const REMINDER_BUDGET_MIN = 80
@@ -227,7 +246,8 @@ export const TOOL_DESCRIPTION =
   'Working state for this session, and the only tracked plan. Call focus_todo(action="list") when ' +
   "you start or resume work, after a compaction, or after a restart. Record a multi-step plan with " +
   'action="replace"; skip the list for a single trivial step. Keep items to a few words, at most one ' +
-  "in_progress, and update the list the moment an item finishes, blocks, or changes scope. Anything " +
+  "in_progress, and update the list the moment an item finishes, blocks, or changes scope. When several " +
+  'items change together, send ONE batch (action="batch" with ops) instead of repeated calls. Anything ' +
   "not in this list is not tracked."
 
 const STATUSES: readonly TodoStatus[] = ["pending", "in_progress", "blocked"]
@@ -240,9 +260,9 @@ export const INPUT_SCHEMA = {
   properties: {
     action: {
       type: "string",
-      enum: ["list", "replace", "add", "update", "complete", "remove", "clear"],
+      enum: ["list", "replace", "add", "update", "remove", "batch"],
       description:
-        "list: read. replace: overwrite all. add/update/remove: one item. complete: mark done, kept as x. clear: drop all.",
+        "list: read. replace: overwrite all (empty clears). add: append one. update: edit text/status, or mark done with done:true. remove: drop one. batch: ops in order, all-or-nothing.",
     },
     text: {
       type: "string",
@@ -250,12 +270,16 @@ export const INPUT_SCHEMA = {
     },
     id: {
       type: "string",
-      description: "Item id (e.g. t3). Required for update, complete, remove.",
+      description: "Item id (e.g. t3). Required for update, remove.",
     },
     status: {
       type: "string",
       enum: ["pending", "in_progress", "blocked"],
       description: "Defaults to pending; at most one item in_progress.",
+    },
+    done: {
+      type: "boolean",
+      description: "For update: true marks the item done (kept as an x row); only true is supported.",
     },
     items: {
       type: "array",
@@ -268,6 +292,40 @@ export const INPUT_SCHEMA = {
           status: { type: "string", enum: ["pending", "in_progress", "blocked"] },
         },
         required: ["text"],
+        additionalProperties: false,
+      },
+    },
+    ops: {
+      type: "array",
+      description: `Required for batch: 1–${MAX_BATCH_OPS} mutations, applied in order, all-or-nothing (one bad op rejects the whole batch).`,
+      items: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["replace", "add", "update", "remove"],
+            description: "list and batch are not allowed inside ops.",
+          },
+          text: { type: "string", description: `For add/update ops: item text, max ${MAX_TEXT} chars.` },
+          id: { type: "string", description: "For update/remove ops: the item id." },
+          status: { type: "string", enum: ["pending", "in_progress", "blocked"] },
+          done: { type: "boolean", description: "For update ops: true marks the item done." },
+          items: {
+            type: "array",
+            description: "For replace ops: the full new list.",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+                text: { type: "string" },
+                status: { type: "string", enum: ["pending", "in_progress", "blocked"] },
+              },
+              required: ["text"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["action"],
         additionalProperties: false,
       },
     },
@@ -384,7 +442,7 @@ export function normalizeState(raw: unknown): { state: TodoState; corrupt: boole
   // A stored list whose counter is missing or behind its own marked rows would render as
   // "done=0" while showing `x` rows — and a panel reading `0 active, done=0` shows nothing
   // at all. Repair it upward; never downward, since a plan's count can legitimately outrun
-  // its rows (the cap drops old marks). A counter reset by `replace`/`clear` has no rows
+  // its rows (the cap drops old marks). A counter reset by `replace` has no rows
   // left either, so the repair cannot resurrect it.
   const marked = kept.filter((item) => item.done === true).length
   const completed = isCount(value.completed) ? Math.max(value.completed, marked) : marked
@@ -585,10 +643,14 @@ export function applyAction(state: TodoState, input: FocusTodoInput): ActionOutc
     }
 
     case "update": {
-      const source = input as { id?: unknown; text?: unknown; status?: unknown }
+      const source = input as { id?: unknown; text?: unknown; status?: unknown; done?: unknown }
       const index = findIndex(state, source.id)
       if (typeof index !== "number") return index
-      if (source.text === undefined && source.status === undefined) return fail("nothing to update")
+      const wantsDone = source.done === true
+      if (source.done !== undefined && source.done !== true) return fail("done only supports true")
+      if (source.text === undefined && source.status === undefined && source.done === undefined) {
+        return fail("nothing to update")
+      }
 
       const current = state.items[index]!
       if (isDone(current)) {
@@ -616,27 +678,20 @@ export function applyAction(state: TodoState, input: FocusTodoInput): ActionOutc
         status = cleaned.status
       }
 
+      if (wantsDone) {
+        // Marked, not deleted: the row stays visible (sidebar, tool result) while the
+        // per-request reminder keeps speaking only about open items. Text and status
+        // edits ride along in the same call, so finishing something renamed on the way
+        // is one op, not two.
+        const items = capped(
+          state.items.map((item, position) => (position === index ? { ...item, text, status, done: true } : item)),
+        )
+        const next = clone(state, items, { completed: state.completed + 1 })
+        return { ok: true, state: next, text: formatState(next), write: true }
+      }
+
       const items = state.items.map((item, position) => (position === index ? { ...item, text, status } : item))
       const next = clone(state, canonical(items))
-      return { ok: true, state: next, text: formatState(next), write: true }
-    }
-
-    case "complete": {
-      const index = findIndex(state, (input as { id?: unknown }).id)
-      if (typeof index !== "number") return index
-      const current = state.items[index]!
-      if (isDone(current)) {
-        const open = openItems(state)
-          .map((item) => item.id)
-          .join(" ")
-        return fail(`${current.id} is already done; open ids: ${open.length === 0 ? "none" : open}`)
-      }
-      // Marked, not deleted: the row stays visible (sidebar, tool result) while the per-request
-      // reminder keeps speaking only about open items.
-      const items = capped(
-        state.items.map((item, position) => (position === index ? { ...item, done: true } : item)),
-      )
-      const next = clone(state, items, { completed: state.completed + 1 })
       return { ok: true, state: next, text: formatState(next), write: true }
     }
 
@@ -650,15 +705,51 @@ export function applyAction(state: TodoState, input: FocusTodoInput): ActionOutc
       return { ok: true, state: next, text: formatState(next), write: true }
     }
 
-    case "clear": {
-      // Same rule as `replace` with no items: rows *and* counter reset, so a cleared
-      // session looks exactly like one that never used the tool.
-      const next = clone(state, [], { completed: 0 })
-      return { ok: true, state: next, text: formatState(next), write: true }
+    case "batch": {
+      const raw = (input as { ops?: unknown }).ops
+      if (!Array.isArray(raw)) return fail("ops must be an array")
+      if (raw.length === 0) return fail("ops is empty")
+      if (raw.length > MAX_BATCH_OPS) return fail(`too many ops (max ${MAX_BATCH_OPS})`)
+
+      // Atomic by construction: every op is applied to a throwaway draft in order;
+      // a single failure rejects the whole batch, so the stored state never sees a
+      // half-applied plan. All failures are reported at once, so one retry can
+      // correct every mistake instead of discovering them one call at a time.
+      let draft = state
+      const errors: string[] = []
+      for (let index = 0; index < raw.length; index += 1) {
+        const op = raw[index]
+        const label = `op ${index + 1}`
+        if (typeof op !== "object" || op === null || Array.isArray(op)) {
+          errors.push(`${label}: must be an object`)
+          continue
+        }
+        const action = (op as { action?: unknown }).action
+        if (action === "batch") {
+          errors.push(`${label}: nested batch not allowed`)
+          continue
+        }
+        if (action === "list") {
+          errors.push(`${label}: list is pointless inside a batch (the result shows the final state)`)
+          continue
+        }
+        const outcome = applyAction(draft, op as FocusTodoInput)
+        if (!outcome.ok) {
+          errors.push(`${label}: ${outcome.error}`)
+          continue
+        }
+        draft = outcome.state
+      }
+      if (errors.length > 0) {
+        const shown = errors.slice(0, 4).join("; ")
+        const rest = errors.length > 4 ? `; +${errors.length - 4} more` : ""
+        return fail(`batch rejected, ${errors.length} of ${raw.length} ops failed: ${shown}${rest}`)
+      }
+      return { ok: true, state: draft, text: formatState(draft), write: true }
     }
 
     default:
-      return fail(`unknown action (use list|replace|add|update|complete|remove|clear)`)
+      return fail(`unknown action (use list|replace|add|update|remove|batch)`)
   }
 }
 

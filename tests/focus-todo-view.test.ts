@@ -273,7 +273,7 @@ describe("buildPanel", () => {
     })
     expect(panel.header).toBe("Focus: all done")
     expect(panel.rows.map((row) => row.status)).toEqual(["done", "done"])
-    expect(panel.rows.map((row) => row.line)).toEqual(["t1:x implement storage", "t2:x add tests"])
+    expect(panel.rows.map((row) => row.line)).toEqual(["✓ t1 implement storage", "✓ t2 add tests"])
   })
 
   test("states the count when nothing is open and the marks were removed too", () => {
@@ -331,7 +331,7 @@ describe("buildPanel", () => {
   test("renders a header plus one row per open item", () => {
     const panel = buildPanel(view(2, 5))
     expect(panel?.header).toBe("Focus 2 active, done 5")
-    expect(panel?.rows.map((row) => row.line)).toEqual(["t1:> item 1", "t2:- item 2"])
+    expect(panel?.rows.map((row) => row.line)).toEqual(["▶ t1 item 1", "○ t2 item 2"])
     expect(panel?.rows[0]?.status).toBe("in_progress")
   })
 

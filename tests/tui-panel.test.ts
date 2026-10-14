@@ -71,11 +71,13 @@ function toolPart(text: string) {
   }
 }
 
+/** Flat palette behind `theme.current` — the shape the host actually hands over. */
 const THEME = {
-  text: {
-    base: "#base",
-    muted: "#muted",
-    feedback: { success: { base: "#ok" }, error: { default: "#bad" } },
+  current: {
+    text: "#base",
+    textMuted: "#muted",
+    success: "#ok",
+    error: "#bad",
   },
 }
 
@@ -211,15 +213,15 @@ describe("panel rendering", () => {
     plugin.setup(context)
 
     const tree = claims[0]?.render({ sessionID: SESSION })
-    expect(renderText(tree)).toEqual(["▼ Focus 2 active, done 1", "未提醒", "t1:> implement storage", "t2:- add tests"])
+    expect(renderText(tree)).toEqual(["▼ Focus 2 active, done 1", "未提醒", "▶ t1 implement storage", "○ t2 add tests"])
 
     // A newer user message means the next request carries the reminder line.
     conversation.push({ role: "user", content: "go on" })
     expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual([
       "▼ Focus 2 active, done 1",
       "已提醒待办",
-      "t1:> implement storage",
-      "t2:- add tests",
+      "▶ t1 implement storage",
+      "○ t2 add tests",
     ])
   })
 
@@ -245,8 +247,8 @@ describe("panel rendering", () => {
     expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual([
       "▼ Focus: all done",
       "未提醒",
-      "t2:x add tests",
-      "t1:x implement storage",
+      "✓ t2 add tests",
+      "✓ t1 implement storage",
     ])
   })
 
@@ -276,7 +278,7 @@ describe("panel rendering", () => {
     })
     plugin.setup(context)
 
-    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ Focus 1 active", "未提醒", "t1:> mine"])
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ Focus 1 active", "未提醒", "▶ t1 mine"])
     expect(renderText(claims[0]?.render({ sessionID: "ses_other0000bbbbbbbbbbbbbbbbbbbbb" }))).toEqual([
       "▼ Focus 0 active, done 2",
       "未提醒",
@@ -311,7 +313,8 @@ describe("panel rendering", () => {
 
     const lines = renderText(claims[0]?.render({ sessionID: SESSION }))
     expect(lines).toHaveLength(3)
-    for (const line of lines) expect(line.length).toBeLessThanOrEqual(15)
+    // terminalWidth 60 → row budget 60/3-2 = 18 columns; every line honours it.
+    for (const line of lines) expect(line.length).toBeLessThanOrEqual(18)
   })
 
   test("colours in-progress, pending and blocked rows differently", () => {
@@ -335,8 +338,15 @@ describe("panel rendering", () => {
       }
     }
     walk(claims[0]?.render({ sessionID: SESSION }))
-    // Header, reminder status, then the three rows — the status line uses the muted colour.
-    expect(collected).toEqual([THEME.text.base, THEME.text.muted, "#ok", "#muted", "#bad"])
+    // Header, reminder status, then the three rows — done recedes, pending is plain
+    // text colour, in-progress is success green, blocked is error red.
+    expect(collected).toEqual([
+      THEME.current.text,
+      THEME.current.textMuted,
+      THEME.current.success,
+      THEME.current.text,
+      THEME.current.error,
+    ])
   })
 })
 
@@ -368,7 +378,7 @@ describe("fold", () => {
 
     const lines = renderText(claims[0]?.render({ sessionID: SESSION }))
     expect(lines[0]).toBe("▼ Focus 1 active")
-    expect(lines).toContain("t1:> mine")
+    expect(lines).toContain("▶ t1 mine")
   })
 
   test("clicking the header folds the panel and persists the flag", () => {

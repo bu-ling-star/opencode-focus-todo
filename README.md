@@ -29,9 +29,9 @@ kept and marked, and a line saying what the model was last told:
 ```
 ▼ Focus 2 active, done 1
 已提醒待办
-t1:> wire up storage
-t2:- write tests
-t3:x read the spec
+▶ t1 wire up storage
+○ t2 write tests
+✓ t3 read the spec
 ```
 
 The panel is a permanent sidebar fixture: before the first `focus_todo` call it shows
@@ -90,12 +90,11 @@ One tool, one `action` union:
 | action | Required fields | Effect |
 | --- | --- | --- |
 | `list` | — | Return open items and the finished count. Read-only. |
-| `replace` | `items[]` | Overwrite the list with these items — a new plan starts clean, so the marked rows **and** the `done` count of the previous plan go with it. Each item: `{id?, text, status?}`. |
+| `replace` | `items[]` | Overwrite the list with these items — a new plan starts clean, so the marked rows **and** the `done` count of the previous plan go with it. Each item: `{id?, text, status?}`. An empty list is the wipe. |
 | `add` | `text` | Append one item (`status` defaults to `pending`). |
-| `update` | `id` | Change `text` and/or `status` of one item. |
-| `complete` | `id` | Mark the item done: it stays in the list as `x` and `done` increments. |
+| `update` | `id` | Change `text` and/or `status`, and/or mark done with `done: true` — all in one call. |
 | `remove` | `id` | Drop the item without counting it as done (and without un-counting it if it was already marked). |
-| `clear` | — | Drop all open items, all marked rows **and** the `done` count: the session reads as if the tool had never run. |
+| `batch` | `ops[]` | Apply 2–24 ops in order — any of `replace`/`add`/`update`/`remove` — all-or-nothing: one failing op rejects the whole batch and nothing is written. |
 
 Rules the tool enforces, returning a short `error=…` line when violated:
 
@@ -114,24 +113,27 @@ item already running (`error=only one in_progress allowed (t1 is in_progress)`),
 can correct itself in the same turn instead of spending a round trip on `list`.
 
 Statuses: `pending` (`-`), `in_progress` (`>`), `blocked` (`!`), and `x` for a marked row in
-the tool result and the panel. A marked row is finished, not gone: the model keeps seeing it
-in every tool result, it stops counting as open, and it is no longer sent in the reminder.
+the tool result; the sidebar renders the same four states as `○ ▶ ! ✓` with theme colours. A
+marked row is finished, not gone: the model keeps seeing it in every tool result, it stops
+counting as open, and it is no longer sent in the reminder.
 
-**A plan owns its marks and its count.** `complete` marks a row and increments `done`; both
-stay visible while that plan is alive, including after the last item finishes, so the sidebar
-can show what just got done. Starting a new plan (`replace`) or wiping the slate (`clear`)
-takes the marked rows *and* the `done` count with it — `done` answers "how far did this plan
-get", not "how much did I ever do", so it never accumulates across unrelated pieces of work.
-`remove <id>` is the one action that touches neither: dropping a row is not un-completing it,
-so the count stays where it was.
+**A plan owns its marks and its count.** `update … done: true` marks a row and increments
+`done`; both stay visible while that plan is alive, including after the last item finishes, so
+the sidebar can show what just got done. Starting a new plan — `replace` with new items, or
+with an empty list to wipe the slate — takes the marked rows *and* the `done` count with it:
+`done` answers "how far did this plan get", not "how much did I ever do", so it never
+accumulates across unrelated pieces of work. `remove <id>` is the one action that touches
+neither: dropping a row is not un-completing it, so the count stays where it was.
 
 A typical agent flow:
 
 ```
 1. focus_todo { action: "replace", items: [{text:"read the spec"}, {text:"implement storage", status:"in_progress"}] }
 2. …work…
-3. focus_todo { action: "complete", id: "t2" }   → 1 active, done=1
-4. focus_todo { action: "add", text: "handle corrupt state", status: "in_progress" }
+3. focus_todo { action: "update", id: "t2", done: true }        → 1 active, done=1
+4. focus_todo { action: "batch", ops: [                          → several edits, one round trip
+     { action: "update", id: "t3", done: true },
+     { action: "add", text: "handle corrupt state", status: "in_progress" } ] }
 5. …the plan is done, the next one starts…       → focus_todo { action: "replace", items: [...] }  → done=0
 ```
 
@@ -218,9 +220,11 @@ third touches a request, and only at its very end.
    *user turn start* (the moment a new instruction is read, and the only moment where a nudge
    is worth its tokens) and only when the list has been idle for `staleAfter` requests:
 
-   * the state line gains a clause — `… | t3- update docs — update it if it changed`;
+   * the state line gains a clause — `… | t3- update docs — automated reminder, update it if it changed`
+     (the word *automated* tells the model the line is the plugin speaking, not the user — the
+     reminder rides in as a user-role message, which models otherwise read as the user asking);
    * a session that has **no list at all** gets one line instead of a state:
-     `[focus_todo] no list yet — focus_todo is available if you want to record a plan`.
+     `[focus_todo] automated reminder — no list yet; focus_todo is available if you want to record a plan`.
 
    Both forms are silent in **subagent sessions**: the host's agent registry (`agent.list()`,
    entries with `mode: "subagent"` — `explore`, `general`, any custom subagent) is read once at
@@ -249,10 +253,10 @@ documents itself:
 {
   "reminder": true,
   "reminderBudget": 360,
-  "staleAfter": 6,
+  "staleAfter": 10,
   "itemChars": 48,
-  "maintenanceNudge": " — update it if it changed",
-  "creationNudge": "[focus_todo] no list yet — focus_todo is available if you want to record a plan"
+  "maintenanceNudge": " — automated reminder, update it if it changed",
+  "creationNudge": "[focus_todo] automated reminder — no list yet; focus_todo is available if you want to record a plan"
 }
 ```
 
@@ -260,10 +264,10 @@ documents itself:
 | --- | --- | --- | --- |
 | `reminder` | `true` | Append the request-tail reminder at all. `false` also means the plugin never even opens the session domain. | — |
 | `reminderBudget` | `360` | Upper bound for the generated state line, in characters. The nudge clause is subtracted from it, so the line yields rather than overrunning; a custom clause longer than the remaining room is used as written (your text is never clipped). | 80…2000 |
-| `staleAfter` | `6` | Requests without list activity after which a user turn start also carries a nudge (both forms above). It is the only cadence the plugin has — both forms repeat on it indefinitely. `0` disables both and keeps the informative reminder. | 0…200 |
+| `staleAfter` | `10` | Requests without list activity after which a user turn start also carries a nudge (both forms above). It is the only cadence the plugin has — both forms repeat on it indefinitely. `0` disables both and keeps the informative reminder. | 0…200 |
 | `itemChars` | `48` | Characters kept per item in that one line, before the clipping `…`. | 16…200 |
-| `maintenanceNudge` | `" — update it if it changed"` | The clause appended to the state line at a stale turn start. A leading space is kept, so the file controls the spacing. | ≤300 chars |
-| `creationNudge` | the `no list yet …` line | The whole line for a session with no list. Worded as availability, and it never tells the model to call anything. | ≤300 chars |
+| `maintenanceNudge` | `" — automated reminder, update it if it changed"` | The clause appended to the state line at a stale turn start. A leading space is kept, so the file controls the spacing. | ≤300 chars |
+| `creationNudge` | the `automated reminder — no list yet …` line | The whole line for a session with no list. Worded as availability, and it never tells the model to call anything. | ≤300 chars |
 
 Environment variables override the file for one-off runs: `FOCUS_TODO_REMINDER`,
 `FOCUS_TODO_REMINDER_BUDGET`, `FOCUS_TODO_STALE_AFTER` and `FOCUS_TODO_ITEM_CHARS` (the two
@@ -295,18 +299,18 @@ re-checked in the unit tests.
 
 | Piece | Size | Paid |
 | --- | --- | --- |
-| Tool block (`name` + description + input schema) | 1566 chars ≈ 392 tokens | once per request, inside the cached prefix (cache read, not a write) |
-| — of which the description | 418 chars ≈ 105 tokens | " |
-| — of which the input schema | 1046 chars ≈ 262 tokens | " |
+| Tool block (`name` + description + input schema) | 2804 chars ≈ 700 tokens | once per request, inside the cached prefix (cache read, not a write) |
+| — of which the description | 522 chars ≈ 130 tokens | " |
+| — of which the input schema | 2180 chars ≈ 545 tokens | " |
 | Request-tail reminder | measured 123 chars ≈ 31 tokens at most in the 16-request capture; bounded by `reminderBudget` at 360 chars ≈ 90 tokens | per request, and only when something is open and the tail does not already show it (7 of 16 requests carried it) |
-| Nudge clause (`— update it if it changed`) | +26 chars ≈ 6 tokens (counts against the same budget) | only at a stale user turn start |
-| Nudge line (`no list yet …`) | 76 chars ≈ 19 tokens | on the `staleAfter` cadence, uncapped — an empty session that is idle draws it every `staleAfter` requests |
+| Nudge clause (`— automated reminder, update it if it changed`) | +46 chars ≈ 12 tokens (counts against the same budget) | only at a stale user turn start |
+| Nudge line (`automated reminder — no list yet …`) | 101 chars ≈ 25 tokens | on the `staleAfter` cadence, uncapped — an empty session that is idle draws it every `staleAfter` requests |
 | Tool results (the list the model reads back) | measured 195 chars ≈ 49 tokens; worst case 16 open items ≈ 2.7 KB ≈ 675 tokens | only when the model itself calls the tool |
 | Marked rows inside those results | ≤ 16 × 32 chars ≈ 128 chars ≈ 32 tokens | " |
 | Session state in storage | ≤ 16 open + 16 marked ≈ 3 KB, one key per session | no tokens |
 | Sidebar panel | 0 bytes | never reaches the model |
 
-For scale: the 19 tools the host sends total 21 092 chars, so this plugin is **7 % of the
+For scale: the 19 tools the host sends total 21 092 chars, so this plugin is **13 % of the
 tool surface**; the system prompt is 17 770 chars / 18 151 bytes and is not touched. Two unit
 tests hold the budget down: one caps the description and the schemas, the other fails if any of
 the eight behavioural rules drops out of the description while it is being reworded.
@@ -319,7 +323,7 @@ the eight behavioural rules drops out of the description while it is being rewor
 
 | Session state | Panel |
 | --- | --- |
-| open items | `Focus N active[, done M]`, a status line, then every row — open items first, marked rows last and newest finish first (`t3:x read the spec`) |
+| open items | `Focus N active[, done M]`, a status line, then every row — open items first, marked rows last and newest finish first (`✓ t3 read the spec`) |
 | no open items, marked rows still there | `Focus: all done`, a status line, then the marked rows |
 | no open items, every marked row removed (`remove`) | `Focus 0 active, done N` — the count is the truth, and `all done` over an empty body would read like a bug |
 | no list yet, or after a `clear` — `0 active, done=0` | the single line `暂无待办` — no status line, because nothing was ever sent |
@@ -338,9 +342,10 @@ the server half's nudge counters are not visible to the TUI half (they live in s
 storage domains), so richer wording like "reminded *and* updated" is deliberately not
 attempted. It reads the newest `focus_todo` tool result already present in the current
 session's message window and renders it. It writes nothing, polls nothing, has no popups and
-no settings, and it does not add a second list. Colours follow the active theme (a marked row
-is drawn subdued), and long lines are clipped to the panel width, counted in display columns
-so CJK text lines up.
+no settings, and it does not add a second list. Colours follow the active theme through the
+host's flat `theme.current` palette (in-progress draws the success colour, blocked the error
+colour, a marked row recedes to the muted text colour), and long lines are clipped to the
+panel width, counted in display columns so CJK text lines up.
 
 If a future OpenCode changes the internal TUI API, the panel turns inert and the tool keeps
 working — the sidebar is never required for the tool to function.
@@ -377,7 +382,7 @@ cp -R src/focus-todo/. ~/.config/opencode/plugin/focus-todo/
 ```
 
 ```bash
-bun test                       # 172 unit tests, incl. a seeded invariant sweep
+bun test                       # 179 unit tests, incl. a seeded invariant sweep
 bunx --bun tsc --noEmit        # strict type check, no node_modules needed
 ```
 
