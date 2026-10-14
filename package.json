@@ -1,0 +1,33 @@
+{
+  "name": "opencode-focus-todo",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Minimal persistent focus checklist for OpenCode v2 sessions: one cache-safe tool, one sidebar panel, zero dependencies.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bu-ling-star/opencode-focus-todo.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bu-ling-star/opencode-focus-todo/issues"
+  },
+  "homepage": "https://github.com/bu-ling-star/opencode-focus-todo#readme",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "todo",
+    "checklist",
+    "sidebar",
+    "tui",
+    "agent"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bunx --bun tsc --noEmit",
+    "verify:provider": "node verify/fake-provider.mjs",
+    "verify:analyze": "node verify/analyze.mjs",
+    "verify:cost": "node verify/cost-report.mjs",
+    "verify:drive": "node verify/drive-capture.mjs",
+    "verify:chat": "node verify/drive-chat.mjs"
+  }
+}

@@ -1,0 +1,1556 @@
+/**
+ * Unit tests for the focus-todo pure core, its persistence binding, and the
+ * shape of the plugin entrypoint. Run with `bun test`.
+ *
+ * Everything here is offline: no OpenCode, no network, no billion-context.
+ */
+
+import { beforeEach, describe, expect, test } from "bun:test"
+
+import focusTodoPlugin, {
+  applyAction,
+  createFocusTodo,
+  emptyState,
+  formatReminder,
+  formatState,
+  injectTail,
+  INPUT_SCHEMA,
+  KEY_PREFIX,
+  MAX_ITEMS,
+  MAX_TEXT,
+  normalizeState,
+  OUTPUT_SCHEMA,
+  DEFAULT_SETTINGS,
+  loadSettings,
+  resetHookRegistration,
+  resolveSettings,
+  userConfigPath,
+  sessionKey,
+  TOOL_DESCRIPTION,
+  TOOL_NAME,
+  type FocusTodo,
+  type FocusTodoInput,
+  type Storage,
+  type TodoState,
+  MAX_DONE,
+  openItems,
+} from "../src/focus-todo/server.ts"
+
+const SESSION = "ses_f33236c3dfferUYpbu0fJCkh3K"
+
+function memoryStorage(seed: Record<string, unknown> = {}) {
+  const data = new Map<string, unknown>(Object.entries(seed))
+  const storage: Storage = {
+    async get(key) {
+      return data.get(key)
+    },
+    async set(key, value) {
+      data.set(key, value)
+    },
+  }
+  return { data, storage }
+}
+
+function core(seed: Record<string, unknown> = {}) {
+  const { data, storage } = memoryStorage(seed)
+  const todo = createFocusTodo(storage, undefined)
+  return { data, run: todo.run, todo, storage }
+}
+
+async function list(run: ReturnType<typeof createFocusTodo>["run"], sessionID = SESSION) {
+  return run(sessionID, { action: "list" })
+}
+
+/**
+ * Stands in for the v2 plugin context: a storage backend plus the `tool` domain
+ * draft. The Proxy records every domain the plugin reaches for, which is how the
+ * "no extra sidebar, no extra state" tests are able to assert anything.
+ * `agents` optionally stands in for the host's agent registry (`agent.list()`
+ * → `{location, data}`), probed shape: entries `{id, mode: "primary"|"subagent"}`.
+ */
+function fakeContext(
+  options: { failGet?: boolean; failTransform?: boolean; failHook?: boolean; agents?: unknown[]; failAgents?: boolean } = {},
+) {
+  const touched: string[] = []
+  const added: Array<{ name: string; description: string; input: unknown; output: unknown; options: unknown }> = []
+  const hooks: Array<{ name: string; callback: (payload: unknown) => Promise<void> | void }> = []
+  const data = new Map<string, unknown>()
+
+  const storage: Storage = {
+    async get(key) {
+      if (options.failGet) throw new Error("store down")
+      return data.get(key)
+    },
+    async set(key, value) {
+      data.set(key, value)
+    },
+  }
+
+  const target = {
+    storage,
+    tool: {
+      async transform(update: (draft: { add(tool: never): void }) => void) {
+        if (options.failTransform) throw new Error("tool domain unavailable")
+        update({
+          add(tool: never) {
+            added.push(tool)
+          },
+        })
+      },
+    },
+    agent: {
+      async list() {
+        if (options.failAgents) throw new Error("agent registry unavailable")
+        return { location: { directory: "test" }, data: options.agents ?? [] }
+      },
+    },
+    session: {
+      async hook(name: string, callback: (payload: unknown) => Promise<void> | void) {
+        if (options.failHook) throw new Error("session domain unavailable")
+        hooks.push({ name, callback })
+      },
+    },
+  }
+
+  const context = new Proxy(target, {
+    get(object, property) {
+      touched.push(String(property))
+      return Reflect.get(object, property)
+    },
+  })
+
+  return { context, touched, added, hooks, data }
+}
+
+describe("applyAction", () => {
+  test("add appends an item with a short predictable id and lists it", () => {
+    const added = applyAction(emptyState(), { action: "add", text: "implement storage" })
+    expect(added.ok).toBe(true)
+    if (!added.ok) return
+    expect(added.state.items).toEqual([{ id: "t1", text: "implement storage", status: "pending" }])
+    expect(added.state.nextId).toBe(2)
+    expect(added.text).toContain("t1:- implement storage")
+  })
+
+  test("add honours an explicit status", () => {
+    const added = applyAction(emptyState(), { action: "add", text: "work", status: "in_progress" })
+    expect(added.ok && added.state.items[0]!.status).toBe("in_progress")
+    expect(added.ok && added.text).toContain("t1:> work")
+  })
+
+  test("replace overwrites the list and keeps supplied ids", () => {
+    const first = applyAction(emptyState(), { action: "add", text: "old" })
+    if (!first.ok) throw new Error("setup failed")
+    const replaced = applyAction(first.state, {
+      action: "replace",
+      items: [
+        { id: "t1", text: "implement storage", status: "in_progress" },
+        { text: "add tests" },
+        { text: "ship", status: "blocked" },
+      ],
+    })
+    expect(replaced.ok).toBe(true)
+    if (!replaced.ok) return
+    expect(replaced.state.items.map((item) => item.id)).toEqual(["t1", "t2", "t3"])
+    expect(replaced.state.items.map((item) => item.status)).toEqual(["in_progress", "pending", "blocked"])
+    expect(replaced.text).toContain("t3:! ship")
+  })
+
+  test("update changes text and status in place", () => {
+    const added = applyAction(emptyState(), { action: "add", text: "draft" })
+    if (!added.ok) throw new Error("setup failed")
+    const updated = applyAction(added.state, { action: "update", id: "t1", text: "final", status: "blocked" })
+    expect(updated.ok && updated.state.items[0]).toEqual({ id: "t1", text: "final", status: "blocked" })
+  })
+
+  test("update without any field is rejected", () => {
+    const added = applyAction(emptyState(), { action: "add", text: "draft" })
+    if (!added.ok) throw new Error("setup failed")
+    expect(applyAction(added.state, { action: "update", id: "t1" })).toEqual({ ok: false, error: "nothing to update" })
+  })
+
+  test("complete marks the item instead of deleting it, and advances the done counter", () => {
+    const added = applyAction(emptyState(), { action: "add", text: "a" })
+    if (!added.ok) throw new Error("setup failed")
+    const completed = applyAction(added.state, { action: "complete", id: "t1" })
+    expect(completed.ok && completed.state.items).toEqual([{ id: "t1", text: "a", status: "pending", done: true }])
+    expect(completed.ok && completed.state.completed).toBe(1)
+    // The model sees the count and a marked row, never the row's full text again.
+    expect(completed.ok && completed.text).toBe("0 active, done=1\nt1:x a")
+
+    // Completing twice is refused, naming what is still open.
+    expect(applyAction(completed.ok ? completed.state : emptyState(), { action: "complete", id: "t1" })).toEqual({
+      ok: false,
+      error: "t1 is already done; open ids: none",
+    })
+  })
+
+  test("a marked item is not open: it is not the in_progress blocker and cannot be updated", () => {
+    const seeded = applyAction(emptyState(), {
+      action: "replace",
+      items: [{ text: "running", status: "in_progress" }, { text: "later" }],
+    })
+    if (!seeded.ok) throw new Error("setup failed")
+    const completed = applyAction(seeded.state, { action: "complete", id: "t1" })
+    if (!completed.ok) throw new Error("complete failed")
+
+    // t1 is marked, so a new in_progress is allowed even though t1 still says in_progress.
+    expect(applyAction(completed.state, { action: "update", id: "t2", status: "in_progress" }).ok).toBe(true)
+    expect(applyAction(completed.state, { action: "update", id: "t1", text: "z" })).toEqual({
+      ok: false,
+      error: "t1 is already done; open ids: t2",
+    })
+  })
+
+  test("the marked rows are capped at the newest MAX_DONE and never counted as open", () => {
+    let state = emptyState()
+    for (let index = 0; index < MAX_DONE + 3; index += 1) {
+      const added = applyAction(state, { action: "add", text: `task ${index}` })
+      if (!added.ok) throw new Error("add failed")
+      const completed = applyAction(added.state, { action: "complete", id: `t${index + 1}` })
+      if (!completed.ok) throw new Error("complete failed")
+      state = completed.state
+    }
+    const marked = state.items.filter((item) => item.done === true)
+    expect(marked).toHaveLength(MAX_DONE)
+    // Newest finish first, oldest mark dropped: the three oldest (t1…t3) are gone.
+    expect(marked[0]?.id).toBe(`t${MAX_DONE + 3}`)
+    expect(marked[marked.length - 1]?.id).toBe("t4")
+    expect(state.completed).toBe(MAX_DONE + 3)
+    expect(openItems(state)).toHaveLength(0)
+  })
+
+  test("marked rows come last in the same order whether items were added or replaced", () => {
+    // Both flows finish t2 last, so both must print the marked group newest-first.
+    const added = applyAction(emptyState(), { action: "add", text: "first" })
+    if (!added.ok) throw new Error("setup failed")
+    const second = applyAction(added.state, { action: "add", text: "second" })
+    if (!second.ok) throw new Error("setup failed")
+    const addFlow = applyAction(second.state, { action: "complete", id: "t1" })
+    if (!addFlow.ok) throw new Error("complete failed")
+    const addFlowDone = applyAction(addFlow.state, { action: "complete", id: "t2" })
+    if (!addFlowDone.ok) throw new Error("complete failed")
+
+    const replaced = applyAction(emptyState(), {
+      action: "replace",
+      items: [{ text: "first" }, { text: "second" }],
+    })
+    if (!replaced.ok) throw new Error("setup failed")
+    const replaceFlow = applyAction(replaced.state, { action: "complete", id: "t1" })
+    if (!replaceFlow.ok) throw new Error("complete failed")
+    const replaceFlowDone = applyAction(replaceFlow.state, { action: "complete", id: "t2" })
+    if (!replaceFlowDone.ok) throw new Error("complete failed")
+
+    expect(addFlowDone.text).toBe("0 active, done=2\nt2:x second\nt1:x first")
+    expect(replaceFlowDone.text).toBe(addFlowDone.text)
+  })
+
+  test("replace starts a clean plan: previous marks and the counter go with it", () => {
+    const seeded = applyAction(emptyState(), {
+      action: "replace",
+      items: [{ text: "first", status: "in_progress" }, { text: "second" }],
+    })
+    if (!seeded.ok) throw new Error("setup failed")
+    const completed = applyAction(seeded.state, { action: "complete", id: "t1" })
+    if (!completed.ok) throw new Error("complete failed")
+    expect(completed.ok && completed.text).toBe("1 active, done=1\nt2:- second\nt1:x first")
+
+    const replanned = applyAction(completed.state, {
+      action: "replace",
+      items: [{ text: "replanned" }, { text: "and another" }],
+    })
+    // Neither the marks nor the count outlive the plan: `done` describes this list, not
+    // the session. The id sequence is the one thing that keeps going (t3/t4, never reused).
+    expect(replanned.ok && replanned.text).toBe("2 active, done=0\nt3:- replanned\nt4:- and another")
+    expect(replanned.ok && replanned.state.completed).toBe(0)
+    expect(replanned.ok && replanned.state.items.every((item) => item.done !== true)).toBe(true)
+  })
+
+  test("replace with an empty list clears the marks as well as the open items", () => {
+    const added = applyAction(emptyState(), { action: "add", text: "first" })
+    if (!added.ok) throw new Error("setup failed")
+    const completed = applyAction(added.state, { action: "complete", id: "t1" })
+    if (!completed.ok) throw new Error("complete failed")
+
+    const emptied = applyAction(completed.state, { action: "replace", items: [] })
+    expect(emptied.ok && emptied.state.items).toEqual([])
+    expect(emptied.ok && emptied.state.completed).toBe(0)
+    expect(emptied.ok && emptied.text).toBe("0 active, done=0")
+  })
+
+  test("remove drops the item without counting it as done", () => {
+    const added = applyAction(emptyState(), { action: "add", text: "a" })
+    if (!added.ok) throw new Error("setup failed")
+    const removed = applyAction(added.state, { action: "remove", id: "t1" })
+    expect(removed.ok && removed.state).toMatchObject({ items: [], completed: 0 })
+  })
+
+  test("remove can also drop a single marked row, without touching the counter", () => {
+    const seeded = applyAction(emptyState(), {
+      action: "replace",
+      items: [{ text: "first" }, { text: "second" }],
+    })
+    if (!seeded.ok) throw new Error("setup failed")
+    const completed = applyAction(seeded.state, { action: "complete", id: "t1" })
+    if (!completed.ok) throw new Error("complete failed")
+
+    const removed = applyAction(completed.state, { action: "remove", id: "t1" })
+    expect(removed.ok && removed.state.items).toEqual([{ id: "t2", text: "second", status: "pending" }])
+    expect(removed.ok && removed.text).toBe("1 active, done=1\nt2:- second")
+    expect(removed.ok && removed.state.completed).toBe(1)
+  })
+
+  test("clear drops open items, marked rows and the done counter, keeping the id sequence", () => {
+    const added = applyAction(emptyState(), { action: "add", text: "a" })
+    if (!added.ok) throw new Error("setup failed")
+    const completed = applyAction(added.state, { action: "complete", id: "t1" })
+    if (!completed.ok) throw new Error("setup failed")
+    const careless = applyAction(completed.state, { action: "add", text: "b" })
+    if (!careless.ok) throw new Error("setup failed")
+    const cleared = applyAction(careless.state, { action: "clear" })
+    // A cleared session reads exactly like one that never used the tool: the panel falls
+    // back to `暂无待办`, and the next plan starts its own count from zero.
+    expect(cleared.ok && cleared.state).toMatchObject({ items: [], completed: 0, nextId: 3 })
+    expect(cleared.ok && cleared.text).toBe("0 active, done=0")
+
+    const next = applyAction(cleared.ok ? cleared.state : emptyState(), { action: "add", text: "c" })
+    expect(next.ok && next.text).toBe("1 active, done=0\nt3:- c")
+  })
+
+  test("a cleared or replanned counter stays zero through the store round-trip", async () => {
+    const { run } = core()
+    await run(SESSION, { action: "replace", items: [{ text: "a" }, { text: "b" }] })
+    await run(SESSION, { action: "complete", id: "t1" })
+    expect(await run(SESSION, { action: "clear" })).toBe("0 active, done=0")
+    // Reloading from the store must not "repair" the reset back: there are no marked rows
+    // left to raise it to, which is exactly the case the upward repair must leave alone.
+    expect(await list(run)).toBe("0 active, done=0")
+    // And the reset survives a restart, where the store is read by a fresh instance.
+    const { data, storage } = memoryStorage()
+    const first = createFocusTodo(storage, undefined)
+    await first.run(SESSION, { action: "replace", items: [{ text: "a" }] })
+    await first.run(SESSION, { action: "complete", id: "t1" })
+    await first.run(SESSION, { action: "replace", items: [{ text: "b" }] })
+    const restarted = createFocusTodo(storage, undefined)
+    expect(await list(restarted.run)).toBe("1 active, done=0\nt2:- b")
+    expect(data.size).toBe(1)
+  })
+
+  test("list is read-only", () => {
+    const state = emptyState()
+    const outcome = applyAction(state, { action: "list" })
+    expect(outcome.ok && outcome.write).toBe(false)
+    expect(outcome.ok && outcome.state).toBe(state)
+  })
+
+  test("empty and whitespace-only text are rejected", () => {
+    for (const text of ["", "   ", "\n\t "]) {
+      const outcome = applyAction(emptyState(), { action: "add", text })
+      expect(outcome).toEqual({ ok: false, error: "empty text" })
+    }
+  })
+
+  test("text longer than the limit is rejected, exactly at the limit is accepted", () => {
+    const tooLong = "x".repeat(MAX_TEXT + 1)
+    expect(applyAction(emptyState(), { action: "add", text: tooLong })).toEqual({
+      ok: false,
+      error: `text too long (max ${MAX_TEXT} chars)`,
+    })
+    expect(applyAction(emptyState(), { action: "add", text: "x".repeat(MAX_TEXT) }).ok).toBe(true)
+  })
+
+  test("text is collapsed to a single line", () => {
+    const outcome = applyAction(emptyState(), { action: "add", text: "  two\n\nlines  " })
+    expect(outcome.ok && outcome.state.items[0]!.text).toBe("two lines")
+  })
+
+  test("the ninth open item is rejected", () => {
+    let state = emptyState()
+    for (let index = 0; index < MAX_ITEMS; index += 1) {
+      const outcome = applyAction(state, { action: "add", text: `item ${index}` })
+      if (!outcome.ok) throw new Error("setup failed")
+      state = outcome.state
+    }
+    expect(applyAction(state, { action: "add", text: "one too many" })).toEqual({
+      ok: false,
+      error: `too many items (max ${MAX_ITEMS})`,
+    })
+    expect(
+      applyAction(state, {
+        action: "replace",
+        items: Array.from({ length: MAX_ITEMS + 1 }, (_, index) => ({ text: `item ${index}` })),
+      }),
+    ).toEqual({ ok: false, error: `too many items (max ${MAX_ITEMS})` })
+  })
+
+  test("unknown ids are rejected for update, complete and remove", () => {
+    for (const action of ["update", "complete", "remove"] as const) {
+      const input = action === "update" ? { action, id: "t9", text: "x" } : { action, id: "t9" }
+      expect(applyAction(emptyState(), input as FocusTodoInput)).toEqual({
+        ok: false,
+        error: "unknown id t9; nothing is open",
+      })
+    }
+  })
+
+  test("an unknown id names the open ids so the model can retry without a list call", () => {
+    const seeded = applyAction(emptyState(), { action: "add", text: "keep" })
+    if (!seeded.ok) throw new Error("setup failed")
+    const second = applyAction(seeded.state, { action: "add", text: "and this" })
+    if (!second.ok) throw new Error("setup failed")
+    expect(applyAction(second.state, { action: "complete", id: "t17" })).toEqual({
+      ok: false,
+      error: "unknown id t17; open ids: t1 t2",
+    })
+  })
+
+  test("invalid status values are rejected", () => {
+    expect(applyAction(emptyState(), { action: "add", text: "a", status: "done" as never })).toEqual({
+      ok: false,
+      error: "invalid status (use pending|in_progress|blocked)",
+    })
+  })
+
+  test("a second in_progress item is rejected, and the conflict is named", () => {
+    const first = applyAction(emptyState(), { action: "add", text: "a", status: "in_progress" })
+    if (!first.ok) throw new Error("setup failed")
+    expect(applyAction(first.state, { action: "add", text: "b", status: "in_progress" })).toEqual({
+      ok: false,
+      error: "only one in_progress allowed (t1 is in_progress)",
+    })
+    expect(
+      applyAction(first.state, {
+        action: "replace",
+        items: [
+          { id: "t5", text: "a", status: "in_progress" },
+          { id: "t6", text: "b", status: "in_progress" },
+        ],
+      }),
+    ).toEqual({ ok: false, error: "only one in_progress allowed (t5 is in_progress)" })
+  })
+
+  test("duplicate ids inside replace are rejected", () => {
+    expect(
+      applyAction(emptyState(), {
+        action: "replace",
+        items: [
+          { id: "t1", text: "a" },
+          { id: "t1", text: "b" },
+        ],
+      }),
+    ).toEqual({ ok: false, error: "duplicate id t1" })
+  })
+
+  test("unknown actions are rejected", () => {
+    expect(applyAction(emptyState(), { action: "purge" } as never)).toEqual({
+      ok: false,
+      error: "unknown action (use list|replace|add|update|complete|remove|clear)",
+    })
+  })
+
+  test("todo content never leaks internal bookkeeping into the model-visible text", () => {
+    const outcome = applyAction(emptyState(), { action: "add", text: "secret plan" })
+    if (!outcome.ok) throw new Error("setup failed")
+    expect(outcome.text).not.toContain("revision")
+    expect(outcome.text).not.toContain("version")
+    expect(outcome.text).not.toContain("nextId")
+    expect(outcome.text).toBe("1 active, done=0\nt1:- secret plan")
+  })
+})
+
+describe("normalizeState", () => {
+  test("absent state is empty and not corrupt", () => {
+    expect(normalizeState(undefined)).toEqual({ state: emptyState(), corrupt: false })
+    expect(normalizeState(null)).toEqual({ state: emptyState(), corrupt: false })
+  })
+
+  test("unrecognised shapes are reported as corrupt", () => {
+    for (const raw of ["junk", 42, [], { version: 2, items: [] }, { version: 1, items: "no" }, {}]) {
+      const result = normalizeState(raw)
+      expect(result.corrupt).toBe(true)
+      expect(result.state).toEqual(emptyState())
+    }
+  })
+
+  test("a malformed item makes the whole value corrupt", () => {
+    const result = normalizeState({ version: 1, items: [{ id: "t1", text: "a", status: "whenever" }] })
+    expect(result.corrupt).toBe(true)
+  })
+
+  test("invariant violations are repaired instead of discarded", () => {
+    const result = normalizeState({
+      version: 1,
+      revision: 4,
+      completed: 2,
+      nextId: 3,
+      items: [
+        { id: "t1", text: "a", status: "in_progress" },
+        { id: "t2", text: "b", status: "in_progress" },
+        ...Array.from({ length: MAX_ITEMS }, (_, index) => ({ id: `x${index}`, text: "filler", status: "pending" })),
+      ],
+    })
+    expect(result.corrupt).toBe(false)
+    expect(result.state.items.length).toBe(MAX_ITEMS)
+    expect(result.state.items.filter((item) => item.status === "in_progress").length).toBe(1)
+    expect(result.state.completed).toBe(2)
+    expect(result.state.revision).toBe(4)
+  })
+
+  test("nextId is pushed past any existing synthetic id", () => {
+    const result = normalizeState({
+      version: 1,
+      revision: 0,
+      completed: 0,
+      nextId: 1,
+      items: [{ id: "t7", text: "a", status: "pending" }],
+    })
+    expect(result.state.nextId).toBe(8)
+  })
+
+  test("a counter behind its own marked rows is repaired upward, never downward", () => {
+    // A store written without the counter (or with a stale one) must not render as
+    // `done=0` while showing `x` rows — and must not lose history it does carry.
+    const missing = normalizeState({
+      version: 1,
+      revision: 1,
+      nextId: 4,
+      items: [
+        { id: "t1", text: "a", status: "pending", done: true },
+        { id: "t2", text: "b", status: "pending", done: true },
+        { id: "t3", text: "c", status: "pending" },
+      ],
+    })
+    expect(missing.state.completed).toBe(2)
+
+    const behind = normalizeState({
+      version: 1,
+      revision: 1,
+      completed: 1,
+      nextId: 4,
+      items: [{ id: "t1", text: "a", status: "pending", done: true }],
+    })
+    expect(behind.state.completed).toBe(1)
+
+    const ahead = normalizeState({
+      version: 1,
+      revision: 1,
+      completed: 9,
+      nextId: 4,
+      items: [{ id: "t1", text: "a", status: "pending", done: true }],
+    })
+    // Nine completions happened in this session's life; the cap only dropped old rows.
+    expect(ahead.state.completed).toBe(9)
+  })
+})
+
+describe("sessionKey", () => {
+  test("accepts real opencode session ids inside the plugin namespace", () => {
+    expect(sessionKey(SESSION)).toBe(`${KEY_PREFIX}${SESSION}`)
+  })
+
+  test("rejects anything that could traverse or escape the namespace", () => {
+    for (const candidate of ["../../etc/passwd", "a/b", "a\\b", "..", "", "   ", "a".repeat(129), "a b", "a*b", null, 7, {}]) {
+      expect(sessionKey(candidate)).toBeUndefined()
+    }
+  })
+
+  test("the key never contains a path separator", () => {
+    const key = sessionKey(SESSION)!
+    expect(key.startsWith(KEY_PREFIX)).toBe(true)
+    expect(key).not.toContain("/..")
+    expect(key).not.toContain("\\")
+    expect(key.split("/")).toEqual(["focus-todo", "session", SESSION])
+  })
+})
+
+describe("formatState", () => {
+  test("is stable, ordered and compact", () => {
+    expect(formatState(emptyState())).toBe("0 active, done=0")
+    const state: TodoState = {
+      version: 1,
+      revision: 0,
+      completed: 2,
+      nextId: 4,
+      items: [
+        { id: "t1", text: "implement storage", status: "in_progress" },
+        { id: "t2", text: "add tests", status: "pending" },
+        { id: "t3", text: "API unavailable", status: "blocked" },
+      ],
+    }
+    expect(formatState(state)).toBe("3 active, done=2\nt1:> implement storage\nt2:- add tests\nt3:! API unavailable")
+  })
+})
+
+describe("createFocusTodo persistence", () => {
+  test("state survives a restart (a fresh instance over the same store)", async () => {
+    const { data, storage } = memoryStorage()
+    const before = createFocusTodo(storage, undefined)
+    await before.run(SESSION, { action: "add", text: "keep me" })
+
+    const after = createFocusTodo(storage, undefined)
+    expect(await list(after.run)).toContain("t1:- keep me")
+    expect(data.size).toBe(1)
+  })
+
+  test("sessions are isolated from each other", async () => {
+    const { run } = core()
+    const other = "ses_00d0c8862ffey0bmKZOEEHikKm"
+    await run(SESSION, { action: "add", text: "mine" })
+    expect(await list(run, other)).toBe("0 active, done=0")
+    expect(await list(run)).toContain("t1:- mine")
+  })
+
+  test("revision advances on writes and is never exposed to the model", async () => {
+    const { data, run } = core()
+    await run(SESSION, { action: "add", text: "a" })
+    expect((data.get(`${KEY_PREFIX}${SESSION}`) as TodoState).revision).toBe(1)
+    await run(SESSION, { action: "add", text: "b" })
+    expect((data.get(`${KEY_PREFIX}${SESSION}`) as TodoState).revision).toBe(2)
+    await list(run)
+    expect((data.get(`${KEY_PREFIX}${SESSION}`) as TodoState).revision).toBe(2)
+    expect(await list(run)).not.toContain("revision")
+  })
+
+  test("invalid session ids fail with a short error and touch nothing", async () => {
+    const { data, run } = core()
+    expect(await run("../evil", { action: "add", text: "x" })).toBe("error=invalid session id")
+    expect(data.size).toBe(0)
+  })
+
+  test("corrupt stored state is reset with a warning instead of crashing", async () => {
+    const key = `${KEY_PREFIX}${SESSION}`
+    const { run } = core({ [key]: "{not json at all" })
+    const first = await run(SESSION, { action: "list" })
+    expect(first.startsWith("warn=stored state was unreadable")).toBe(true)
+    expect(first).toContain("0 active, done=0")
+    expect(await run(SESSION, { action: "add", text: "recovered" })).toContain("t1:- recovered")
+  })
+
+  test("a failing store degrades to a warning, not an exception", async () => {
+    const broken: Storage = {
+      async get() {
+        throw new Error("db gone")
+      },
+      async set() {
+        throw new Error("db gone")
+      },
+    }
+    const run = createFocusTodo(broken, undefined).run
+    const read = await run(SESSION, { action: "list" })
+    expect(read).toBe("warn=state store unavailable, list is not persisted\n0 active, done=0")
+    const write = await run(SESSION, { action: "add", text: "x" })
+    expect(write).toContain("error=state store write failed")
+  })
+
+  test("concurrent mutations on one session all land", async () => {
+    const { run } = core()
+    const results = await Promise.all(
+      Array.from({ length: MAX_ITEMS }, (_, index) => run(SESSION, { action: "add", text: `task ${index}` })),
+    )
+    expect(results.every((result) => !result.startsWith("error="))).toBe(true)
+    const listed = await list(run)
+    expect(listed.split("\n").length).toBe(MAX_ITEMS + 1)
+    for (let index = 0; index < MAX_ITEMS; index += 1) expect(listed).toContain(`task ${index}`)
+  })
+
+  test("concurrent mutations on different sessions do not interleave", async () => {
+    const { run } = core()
+    const sessions = Array.from({ length: 6 }, (_, index) => `ses_concurrent${index}`)
+    await Promise.all(sessions.map((session, index) => run(session, { action: "add", text: `only ${index}` })))
+    for (const [index, session] of sessions.entries()) {
+      const listed = await list(run, session)
+      expect(listed).toBe(`1 active, done=0\nt1:- only ${index}`)
+    }
+  })
+
+  test("the serialization map does not grow without bound", async () => {
+    const { data, storage } = memoryStorage()
+    const todo = createFocusTodo(storage, undefined)
+    for (let index = 0; index < 50; index += 1) await todo.run(`ses_burst${index}`, { action: "add", text: "x" })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(data.size).toBe(50)
+    expect(todo.pendingSessions()).toBe(0)
+  })
+})
+
+describe("plugin entrypoint", () => {
+  const env = (globalThis as { process?: { env: Record<string, string | undefined> } }).process!.env
+
+  beforeEach(() => {
+    resetHookRegistration()
+    // Point the settings lookup at a directory that does not exist, so a real
+    // ~/.config/opencode/focus-todo.json on the machine can never change what
+    // these tests observe (it did once: a verification file with the invitation
+    // silenced silently disabled it here, back when a key could do that).
+    env["XDG_CONFIG_HOME"] = "C:\\focus-todo-tests-no-config"
+    // The two pins below then only spell out the intended shipped defaults.
+    env["FOCUS_TODO_REMINDER"] = "1"
+    env["FOCUS_TODO_STALE_AFTER"] = "6"
+  })
+
+  test("the description stays small and keeps every rule it carries", () => {
+    // Size budget: the description is part of the cached prefix and is re-sent on
+    // every request of every session, so growth is a product decision, not a
+    // side effect of a rewording. The current wording is ~410 characters.
+    expect(TOOL_DESCRIPTION.length).toBeLessThanOrEqual(430)
+
+    // Rule coverage, one marker per rule. Rewording is fine; losing a rule is not.
+    expect(TOOL_DESCRIPTION).toContain('action="list"') // the resume call
+    expect(TOOL_DESCRIPTION).toContain("compaction")
+    expect(TOOL_DESCRIPTION).toContain("restart")
+    expect(TOOL_DESCRIPTION).toContain('action="replace"') // record multi-step plans
+    expect(TOOL_DESCRIPTION).toContain("trivial") // and skip the list for trivial ones
+    expect(TOOL_DESCRIPTION).toContain("few words") // item brevity
+    expect(TOOL_DESCRIPTION).toContain("in_progress")
+    expect(TOOL_DESCRIPTION).toContain("not tracked") // the authority line
+  })
+
+  test("the schemas stay small too: they are the other half of the cached prefix", () => {
+    expect(JSON.stringify(INPUT_SCHEMA).length).toBeLessThanOrEqual(1050)
+    expect(JSON.stringify(OUTPUT_SCHEMA)).toBe('{"type":"string"}')
+  })
+
+  test("registers exactly one tool named focus_todo with a fixed definition", async () => {
+    const { context, added } = fakeContext()
+    await focusTodoPlugin.setup(context as never)
+
+    expect(added.length).toBe(1)
+    expect(added[0]!.name).toBe(TOOL_NAME)
+    expect(TOOL_NAME).toBe("focus_todo")
+    expect(added[0]!.description).toBe(TOOL_DESCRIPTION)
+    expect(added[0]!.input).toEqual(INPUT_SCHEMA)
+    expect(added[0]!.output).toEqual(OUTPUT_SCHEMA)
+    // Without codemode:false the host hides plugin tools inside the code-mode
+    // sandbox and they never reach the wire tool list.
+    expect(added[0]!.options).toEqual({ codemode: false })
+  })
+
+  test("touches only storage, tool, the agent registry and the context hook: no TUI slots, no second sidebar", async () => {
+    const { context, touched } = fakeContext()
+    await focusTodoPlugin.setup(context as never)
+    // `agent` is read once at setup to tell primary sessions from subagent ones
+    // (it only ever feeds the nudge gate); `session` once, for the context hook.
+    expect([...new Set(touched)].sort()).toEqual(["agent", "session", "storage", "tool"])
+  })
+
+  test("registers exactly one hook: the context hook for the request reminder", async () => {
+    const { context, hooks } = fakeContext()
+    await focusTodoPlugin.setup(context as never)
+    expect(hooks.length).toBe(1)
+    expect(hooks[0]!.name).toBe("context")
+  })
+
+  test("the hook reads the host's agent registry and never nudges a subagent session", async () => {
+    const { context, hooks } = fakeContext({
+      agents: [
+        { id: "build", mode: "primary" },
+        { id: "explore", mode: "subagent" },
+        { id: "general", mode: "subagent" },
+        { id: "plan", mode: "primary" },
+      ],
+    })
+    await focusTodoPlugin.setup(context as never)
+    expect(hooks.length).toBe(1)
+    const callback = hooks[0]!.callback
+    const turnMessage = { id: "m1", role: "user", content: [{ type: "text", text: "go" }], metadata: {} }
+
+    // A subagent's fresh session: the invitation is suppressed, nothing lands.
+    const invite = { sessionID: "ses_subagentprobe00000000001", agent: "explore", messages: [{ ...turnMessage }] }
+    await callback(invite)
+    expect((invite as { messages: unknown[] }).messages.length).toBe(1)
+
+    // A primary session with the same shape: the invitation is the whole point.
+    const primary = { sessionID: "ses_primaryprobe00000000001", agent: "build", messages: [{ ...turnMessage }] }
+    await callback(primary)
+    expect((primary as { messages: unknown[] }).messages.length).toBe(2)
+  })
+
+  test("a failing agent registry costs the nudge filter, not the reminder", async () => {
+    const { context, hooks } = fakeContext({ agents: [], failAgents: true })
+    await focusTodoPlugin.setup(context as never)
+    expect(hooks.length).toBe(1)
+    const payload = { sessionID: "ses_failagentsprobe0000000001", agent: "explore", messages: [{ id: "m1", role: "user", content: [{ type: "text", text: "go" }], metadata: {} }] }
+    await hooks[0]!.callback(payload)
+    // The set is empty, so nothing is identified as a subagent and the
+    // invitation fires — the pre-filter behaviour, kept as the fallback.
+    expect((payload as { messages: unknown[] }).messages.length).toBe(2)
+  })
+
+  test("the registered hook appends the reminder to the request tail", async () => {
+    const { context, hooks, added } = fakeContext()
+    await focusTodoPlugin.setup(context as never)
+    const tool = added[0] as unknown as { execute(input: unknown, tool: { sessionID?: string }): Promise<unknown> }
+    await tool.execute({ action: "add", text: "wire up storage", status: "in_progress" }, { sessionID: SESSION })
+
+    const payload = {
+      sessionID: SESSION,
+      messages: [{ id: "m1", role: "user", content: [{ type: "text", text: "hello" }], metadata: {} }],
+    }
+    await hooks[0]!.callback(payload)
+
+    expect(payload.messages.length).toBe(2)
+    const appended = payload.messages[1] as unknown as { role: string; content: Array<{ text: string }> }
+    expect(appended.role).toBe("user")
+    expect(appended.content[0]!.text).toContain("t1> wire up storage")
+    expect(appended.content[0]!.text).toContain("[focus_todo] 1 open")
+  })
+
+  test("the hook adds one message at most, and only the invitation for a fresh session", async () => {
+    const { context, hooks } = fakeContext()
+    await focusTodoPlugin.setup(context as never)
+    const payload = { sessionID: SESSION, messages: [{ id: "m1", role: "user", content: "hi", metadata: {} }] }
+    await hooks[0]!.callback(payload)
+    // Nothing is open, so there is no state to report — but a session this process
+    // has never seen gets the one-line invitation to record a plan.
+    expect(payload.messages.length).toBe(2)
+    expect(JSON.stringify(payload.messages[1])).toContain("no list yet")
+  })
+
+  test("the hook never mutates anything but the message array it is handed", async () => {
+    const { context, hooks, added } = fakeContext()
+    await focusTodoPlugin.setup(context as never)
+    const tool = added[0] as unknown as { execute(input: unknown, tool: { sessionID?: string }): Promise<unknown> }
+    await tool.execute({ action: "add", text: "keep me" }, { sessionID: SESSION })
+
+    const system = [{ type: "text", text: "base system prompt" }]
+    const payload = {
+      sessionID: SESSION,
+      system,
+      messages: [{ id: "m1", role: "user", content: "hi", metadata: {} }],
+      options: { maxTokens: 8000 },
+      tools: { focus_todo: {} },
+    }
+    const before = JSON.stringify({ system: payload.system, options: payload.options, tools: payload.tools })
+    await hooks[0]!.callback(payload)
+    expect(JSON.stringify({ system: payload.system, options: payload.options, tools: payload.tools })).toBe(before)
+    expect(system.length).toBe(1)
+  })
+
+  test("a failing session domain costs the reminder, not the tool", async () => {
+    const { context, added } = fakeContext({ failHook: true })
+    await expect(focusTodoPlugin.setup(context as never)).resolves.toBeUndefined()
+    expect(added.length).toBe(1)
+  })
+
+  test("FOCUS_TODO_REMINDER=0 registers no hook at all, and keeps the tool", async () => {
+    const env = (globalThis as { process?: { env: Record<string, string | undefined> } }).process!.env
+    const original = env["FOCUS_TODO_REMINDER"]
+    try {
+      env["FOCUS_TODO_REMINDER"] = "0"
+      const { context, added, hooks, touched } = fakeContext()
+      await focusTodoPlugin.setup(context as never)
+      expect(hooks.length).toBe(0)
+      expect(added.length).toBe(1)
+      // With the reminder off the session domain is never even looked at.
+      expect([...new Set(touched)].sort()).toEqual(["storage", "tool"])
+    } finally {
+      if (original === undefined) delete env["FOCUS_TODO_REMINDER"]
+      else env["FOCUS_TODO_REMINDER"] = original
+    }
+  })
+
+  test("never claims a tool name owned by billion-context or the native tool set", () => {
+    const forbidden = [
+      "todo",
+      "todowrite",
+      "todoread",
+      "compress",
+      "decompress",
+      "search_context",
+      "acp_status",
+      "absorb",
+      "acp_cache",
+      "read",
+      "write",
+      "edit",
+      "shell",
+      "subagent",
+    ]
+    expect(forbidden).not.toContain(TOOL_NAME)
+  })
+
+  test("a failing storage or tool domain never throws during setup", async () => {
+    for (const options of [{ failGet: true }, { failTransform: true }, { failGet: true, failTransform: true }]) {
+      const { context } = fakeContext(options)
+      await expect(focusTodoPlugin.setup(context as never)).resolves.toBeUndefined()
+    }
+  })
+
+  test("setup survives a context whose domains are entirely missing", async () => {
+    await expect(focusTodoPlugin.setup({} as never)).resolves.toBeUndefined()
+  })
+
+  test("the tool works with no other plugin present", async () => {
+    const { context, added } = fakeContext()
+    await focusTodoPlugin.setup(context as never)
+    const tool = added[0] as unknown as {
+      execute(input: unknown, tool: { sessionID?: string }): Promise<{ output: string }>
+    }
+    const result = await tool.execute({ action: "add", text: "solo" }, { sessionID: SESSION })
+    expect(result.output).toContain("t1:- solo")
+    const read = await tool.execute({ action: "list" }, { sessionID: SESSION })
+    expect(read.output).toContain("1 active, done=0")
+  })
+
+  test("the tool reports a short error when the session id is missing", async () => {
+    const { context, added } = fakeContext()
+    await focusTodoPlugin.setup(context as never)
+    const tool = added[0] as unknown as { execute(input: unknown, tool: {}): Promise<{ output: string }> }
+    expect((await tool.execute({ action: "list" }, {})).output).toBe("error=invalid session id")
+  })
+})
+
+describe("cache prefix stability", () => {
+  const mutate: FocusTodoInput[] = [
+    { action: "add", text: "implement storage" },
+    { action: "update", id: "t1", text: "implement storage safely" },
+    { action: "update", id: "t1", status: "in_progress" },
+    { action: "add", text: "add tests", status: "blocked" },
+    { action: "complete", id: "t1" },
+    { action: "clear" },
+  ]
+
+  test("tool definitions are byte-identical before and after every todo mutation", async () => {
+    const { context, added, data } = fakeContext()
+    await focusTodoPlugin.setup(context as never)
+    const definition = () => JSON.stringify({ description: TOOL_DESCRIPTION, input: INPUT_SCHEMA, output: OUTPUT_SCHEMA })
+    const before = definition()
+
+    const tool = added[0] as unknown as {
+      execute(input: unknown, tool: { sessionID?: string }): Promise<{ output: string }>
+    }
+    for (const input of mutate) await tool.execute(input, { sessionID: SESSION })
+
+    expect(definition()).toBe(before)
+    expect(data.size).toBe(1)
+    expect([...data.keys()]).toEqual([`${KEY_PREFIX}${SESSION}`])
+  })
+
+  test("a second setup produces the identical single-tool definition", async () => {
+    const first = fakeContext()
+    await focusTodoPlugin.setup(first.context as never)
+    const tool = first.added[0] as unknown as {
+      execute(input: unknown, tool: { sessionID?: string }): Promise<{ output: string }>
+    }
+    await tool.execute({ action: "add", text: "a" }, { sessionID: SESSION })
+
+    const second = fakeContext()
+    await focusTodoPlugin.setup(second.context as never)
+
+    expect(JSON.stringify(second.added)).toBe(JSON.stringify(first.added))
+    expect(second.added.map((entry) => entry.name)).toEqual([TOOL_NAME])
+  })
+
+  test("the plugin writes only to its own session key, never to the native todo store", async () => {
+    const { context, data, added } = fakeContext()
+    await focusTodoPlugin.setup(context as never)
+    const tool = added[0] as unknown as {
+      execute(input: unknown, tool: { sessionID?: string }): Promise<{ output: string }>
+    }
+    await tool.execute({ action: "add", text: "a" }, { sessionID: SESSION })
+    expect([...data.keys()]).toEqual([`${KEY_PREFIX}${SESSION}`])
+  })
+
+  test("the reminder changes with the list but never touches the tool definition", async () => {
+    const { context, added, data } = fakeContext()
+    await focusTodoPlugin.setup(context as never)
+    const definition = () => JSON.stringify(added[0])
+    const before = definition()
+
+    const tool = added[0] as unknown as {
+      execute(input: unknown, tool: { sessionID?: string }): Promise<{ output: string }>
+    }
+    const lines: string[] = []
+    for (const input of mutate) {
+      await tool.execute(input, { sessionID: SESSION })
+      // What the reminder hook would send for this state, read from the store.
+      const line = formatReminder(normalizeState(data.get(`${KEY_PREFIX}${SESSION}`)).state)
+      if (line !== undefined) lines.push(line)
+      expect(definition()).toBe(before)
+    }
+
+    // The reminder text itself tracks the list (that is its whole purpose) and
+    // the mutations above walk the list through several shapes.
+    expect(new Set(lines).size).toBeGreaterThan(1)
+    expect(lines.some((line) => line.includes("t1> implement storage safely"))).toBe(true)
+  })
+})
+
+describe("formatReminder", () => {
+  function stateWith(
+    items: Array<{ id: string; text: string; status: "pending" | "in_progress" | "blocked" }>,
+    completed = 0,
+  ): TodoState {
+    return { version: 1, revision: 1, completed, nextId: items.length + 1, items }
+  }
+
+  // Long enough that 16 of them cannot fit the default 360 character budget.
+  const filler = (count: number) =>
+    Array.from({ length: count }, (_, index) => ({
+      id: `t${index + 1}`,
+      text: `task ${index + 1} ${"x".repeat(24)}`,
+      status: "pending" as const,
+    }))
+
+  test("says nothing when nothing is open", () => {
+    expect(formatReminder(stateWith([], 4))).toBeUndefined()
+    expect(formatReminder(emptyState())).toBeUndefined()
+  })
+
+  test("one line, with the count, the items and the marker convention", () => {
+    const line = formatReminder(stateWith([{ id: "t1", text: "wire up storage", status: "in_progress" }], 2))
+    expect(line).toBe("[focus_todo] 1 open, 2 done: t1> wire up storage")
+    expect(line?.includes("\n")).toBe(false)
+  })
+
+  test("puts the running item first, then the blocked ones, then list order", () => {
+    const line = formatReminder(
+      stateWith([
+        { id: "t1", text: "read the spec", status: "pending" },
+        { id: "t2", text: "waiting on review", status: "blocked" },
+        { id: "t3", text: "not started", status: "pending" },
+        { id: "t4", text: "implement storage", status: "in_progress" },
+      ]),
+    )!
+    const order = [...line.matchAll(/(t\d)[>!-]/g)].map((match) => match[1])
+    expect(order).toEqual(["t4", "t2", "t1", "t3"])
+    expect(line.startsWith("[focus_todo] 4 open: t4> implement storage")).toBe(true)
+  })
+
+  test("states the remainder as +k more instead of cutting the list silently", () => {
+    const line = formatReminder(stateWith(filler(MAX_ITEMS)), DEFAULT_SETTINGS.reminderBudget)!
+    expect(line).toMatch(/\+\d+ more$/)
+    expect(line.length).toBeLessThanOrEqual(DEFAULT_SETTINGS.reminderBudget)
+    expect(line.startsWith(`[focus_todo] ${MAX_ITEMS} open: t1- task 1`)).toBe(true)
+
+    // A wide budget keeps every item and adds no remainder note.
+    const wide = formatReminder(stateWith(filler(4)), 4000)!
+    expect(wide).not.toContain("more")
+    expect([...wide.matchAll(/(t\d)[>!-]/g)]).toHaveLength(4)
+  })
+
+  test("keeps the running item even with a tiny budget, and clips oversized items", () => {
+    const tiny = formatReminder(stateWith(filler(3)), 80)!
+    expect(tiny.length).toBeLessThanOrEqual(80)
+    expect(tiny.startsWith("[focus_todo] 3 open: t1- task 1")).toBe(true)
+
+    const long = formatReminder(stateWith([{ id: "t1", text: "x".repeat(MAX_TEXT), status: "pending" }]))
+    expect(long!.length).toBeLessThan(120)
+    expect(long!.endsWith("\u2026")).toBe(true)
+  })
+
+  test("never exceeds the budget, whatever it is set to", () => {
+    const many = stateWith(
+      Array.from({ length: MAX_ITEMS }, (_, index) => ({
+        id: `t${index + 1}`,
+        text: "y".repeat(MAX_TEXT),
+        status: "pending" as const,
+      })),
+    )
+    for (const budget of [80, 200, 360, 2000]) {
+      const line = formatReminder(many, budget)!
+      expect(line.length).toBeLessThanOrEqual(budget)
+      expect(line).toContain(`${MAX_ITEMS} open`)
+    }
+  })
+
+  test("a non-finite budget falls back to the default instead of turning the bound off", () => {
+    const many = stateWith(filler(MAX_ITEMS))
+    for (const budget of [Number.NaN, Number.POSITIVE_INFINITY, -5]) {
+      const line = formatReminder(many, budget)
+      expect(line).toBeDefined()
+      expect(line!.length).toBeLessThanOrEqual(DEFAULT_SETTINGS.reminderBudget)
+    }
+  })
+})
+
+describe("injectTail", () => {
+  // The reminder carries a per-session cadence; a fresh process per test keeps the
+  // cases independent. The nudge tests below drive the same memo on purpose.
+  beforeEach(() => {
+    resetHookRegistration()
+  })
+
+  function request(messages: unknown[], sessionID: unknown = SESSION) {
+    return { sessionID, messages, system: [{ type: "text", text: "sys" }], options: { maxTokens: 1 }, tools: {} }
+  }
+
+  const user = (id: string, text: string) => ({
+    id,
+    role: "user",
+    content: [{ type: "text", text }],
+    metadata: { a: 1 },
+  })
+
+  test("appends exactly one trailing user message and reports success", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "wire up storage", status: "in_progress" })
+    const messages: unknown[] = [user("m1", "hello")]
+    const payload = request(messages)
+
+    expect(await injectTail(todo, payload)).toBe(true)
+    expect(payload.messages.length).toBe(2)
+    const appended = messages[1] as Record<string, unknown>
+    expect(appended["role"]).toBe("user")
+    expect(JSON.stringify(appended["content"])).toContain("t1> wire up storage")
+    expect(Array.isArray(appended["content"])).toBe(true)
+    expect(appended["metadata"]).toEqual({ a: 1 })
+  })
+
+  test("mirrors a string-content session instead of assuming parts", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "keep the shape" })
+    const payload = request([{ id: "m1", role: "user", content: "plain string", metadata: {} }])
+    await injectTail(todo, payload)
+    expect(typeof (payload.messages[1] as Record<string, unknown>)["content"]).toBe("string")
+  })
+
+  test("does not append a second reminder when one is already last", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "wire up storage" })
+    const payload = request([user("m1", "hello"), user("m2", "[focus_todo] 1 open: t1- wire up storage")])
+    expect(await injectTail(todo, payload)).toBe(false)
+    expect(payload.messages.length).toBe(2)
+  })
+
+  test("stays quiet when the newest message already shows the same state", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "wire up storage" })
+    // The host nests a tool result's text inside its own part shape, so the
+    // check has to walk the whole value rather than read a `text` field.
+    const fresh = request([
+      user("m1", "hello"),
+      {
+        id: "m2",
+        role: "tool",
+        content: [
+          { type: "tool-result", toolCallId: "c1", output: { output: "1 active, done=0\nt1:- wire up storage" } },
+        ],
+      },
+    ])
+    expect(await injectTail(todo, fresh)).toBe(false)
+
+    // A tool result for a different state does not silence the reminder.
+    await todo.run(SESSION, { action: "add", text: "add tests" })
+    expect(await injectTail(todo, fresh)).toBe(true)
+  })
+
+  test("honours the settings switch and the budget", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "wire up storage" })
+
+    const off = request([user("m1", "hello")])
+    expect(await injectTail(todo, off, { ...DEFAULT_SETTINGS, reminder: false })).toBe(false)
+    expect(off.messages.length).toBe(1)
+
+    const small = request([user("m1", "hello")])
+    expect(await injectTail(todo, small, { ...DEFAULT_SETTINGS, reminderBudget: 80, staleAfter: 0 })).toBe(true)
+    expect(JSON.stringify((small.messages[1] as Record<string, unknown>)["content"]).length).toBeLessThanOrEqual(90)
+  })
+
+  test("appends nothing when the session has nothing open and nudging is off", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "clear" })
+    const payload = request([user("m1", "hi")])
+    expect(await injectTail(todo, payload, { ...DEFAULT_SETTINGS, staleAfter: 0 })).toBe(false)
+    expect(payload.messages.length).toBe(1)
+  })
+
+  test("an invalid session id is left alone; another session has its own state", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "elsewhere" })
+
+    const invalid = request([user("m1", "hi")], "../escape")
+    expect(await injectTail(todo, invalid)).toBe(false)
+
+    // A different but valid session sees its own (empty) list, so it gets the
+    // "no list yet" invitation rather than the other session's items.
+    const other = request([user("m1", "hi")], "ses_other")
+    expect(await injectTail(todo, other)).toBe(true)
+    const text = JSON.stringify((other.messages[1] as Record<string, unknown>)["content"])
+    expect(text).toContain("no list yet")
+    expect(text).not.toContain("elsewhere")
+  })
+
+  test("shrugs at malformed payloads instead of throwing into the request path", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "x" })
+    expect(await injectTail(todo, undefined)).toBe(false)
+    expect(await injectTail(todo, null)).toBe(false)
+    expect(await injectTail(todo, { sessionID: SESSION })).toBe(false)
+    expect(await injectTail(todo, { sessionID: SESSION, messages: [] })).toBe(false)
+    expect(await injectTail(todo, { sessionID: SESSION, messages: "not an array" })).toBe(false)
+  })
+
+  test("a dead store costs the reminder, never the request", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "x" })
+    const broken: FocusTodo = {
+      run: todo.run,
+      peek: async () => {
+        throw new Error("store down")
+      },
+      pendingSessions: todo.pendingSessions,
+    }
+    const payload = request([user("m1", "hi")])
+    expect(await injectTail(broken, payload)).toBe(false)
+    expect(payload.messages.length).toBe(1)
+  })
+
+  test("a pinned or hostile message array cannot take the request down", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "x" })
+
+    // A frozen array refuses the append; the failure must stay inside the hook.
+    const frozen = Object.freeze([user("m1", "hi")])
+    expect(await injectTail(todo, request(frozen as unknown[]))).toBe(false)
+
+    // A content accessor that throws anywhere in the walk must be swallowed too.
+    const hostile = [
+      {
+        id: "m1",
+        role: "user",
+        get content(): unknown {
+          throw new Error("nope")
+        },
+      },
+    ]
+    expect(await injectTail(todo, request(hostile))).toBe(false)
+  })
+
+  test("a message content nested so deep the walk gives up simply stops matching", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "x" })
+    // 12 levels of wrapping: beyond the walk's depth limit, so nothing matches and the
+    // reminder is still appended (the guard can only be conservative, never harmful).
+    let nested: unknown = { text: `[focus_todo] ${TOOL_NAME}` }
+    for (let depth = 0; depth < 12; depth += 1) nested = { child: nested }
+    const payload = request([{ id: "m1", role: "user", content: nested, metadata: {} }])
+    expect(await injectTail(todo, payload)).toBe(true)
+    expect(payload.messages.length).toBe(2)
+  })
+})
+
+describe("nudges: inviting the model to use the list", () => {
+  beforeEach(() => {
+    resetHookRegistration()
+  })
+
+  function request(messages: unknown[], sessionID: unknown = SESSION) {
+    return { sessionID, messages, system: [{ type: "text", text: "sys" }], options: {}, tools: {} }
+  }
+  const turn = (id: string) => ({ id, role: "user", content: [{ type: "text", text: `what about ${id}` }], metadata: {} })
+  const toolResult = (id: string, text = "shell output") => ({ id, role: "tool", content: [{ type: "text", text }], metadata: {} })
+  const settings = { ...DEFAULT_SETTINGS, staleAfter: 2 }
+  // The injected message mirrors the shape of the turn before it, so its content
+  // may be a string or a parts array; both stringify to something readable here.
+  const lastText = (payload: { messages: unknown[] }) =>
+    JSON.stringify((payload.messages[payload.messages.length - 1] as Record<string, unknown>)["content"])
+
+  test("a session with no list gets one invitation at the first unseen turn, then one per `staleAfter` requests", async () => {
+    const { todo } = core()
+    const first = request([turn("m1")])
+    expect(await injectTail(todo, first, settings)).toBe(true)
+    expect(lastText(first)).toContain("no list yet")
+    // An offer, not an order: it says the tool is available, and never tells the
+    // model to call anything.
+    expect(lastText(first)).toContain("is available")
+    expect(lastText(first)).not.toContain("replace")
+
+    // Same session, next turn: one request of quiet is nowhere near the threshold.
+    const second = request([turn("m1"), turn("m2")])
+    expect(await injectTail(todo, second, settings)).toBe(false)
+    expect(second.messages.length).toBe(2)
+  })
+
+  test("the invitation is never rationed: it returns on the cadence for as long as there is no list", async () => {
+    const { todo } = core()
+    // `staleAfter: 2` with two quiet requests between turns, so every turn start is
+    // stale. The old per-session cap of 3 would have stopped the line here.
+    const fired: number[] = []
+    for (let round = 0; round < 10; round += 1) {
+      for (let quiet = 0; quiet < 2; quiet += 1) await injectTail(todo, request([toolResult(`q${round}-${quiet}`)]), settings)
+      const payload = request([turn(`t${round}`)])
+      if (await injectTail(todo, payload, settings)) {
+        fired.push(round)
+        expect(lastText(payload)).toContain("no list yet")
+      }
+    }
+    expect(fired).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+    // And it still cannot land twice in a row: a fired nudge resets the cadence.
+    const immediate = request([turn("m1"), turn("m2")])
+    expect(await injectTail(todo, immediate, settings)).toBe(false)
+  })
+
+  test("with a list, the nudge is a clause on the state line, spaced by `staleAfter`", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "implement storage", status: "in_progress" })
+
+    // First turn of a fresh process: the list exists and is probably stale, so the
+    // line carries the clause.
+    const resumed = request([turn("m1")])
+    expect(await injectTail(todo, resumed, settings)).toBe(true)
+    expect(lastText(resumed)).toContain("1 open")
+    expect(lastText(resumed)).toContain("update it if it changed")
+
+    // Firing reset the counter, so the very next turn is informative only.
+    const quiet = request([turn("m1"), turn("m2")])
+    expect(await injectTail(todo, quiet, settings)).toBe(true)
+    expect(lastText(quiet)).toContain("1 open")
+    expect(lastText(quiet)).not.toContain("update it")
+
+    // Two requests without list activity, then a turn start: the clause is back.
+    await injectTail(todo, request([toolResult("a")]), settings)
+    await injectTail(todo, request([toolResult("b")]), settings)
+    const stale = request([turn("m2"), turn("m3")])
+    expect(await injectTail(todo, stale, settings)).toBe(true)
+    expect(lastText(stale)).toContain("update it if it changed")
+  })
+
+  test("using the tool resets the cadence, so a working session is never nudged", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "implement storage" })
+
+    for (let round = 0; round < 4; round += 1) {
+      // The model updates the list; the next request's tail is that tool result.
+      await todo.run(SESSION, { action: "update", id: "t1", text: `implement storage ${round}` })
+      const echo = request([toolResult("m", "1 active, done=0\nt1:- implement storage")])
+      expect(await injectTail(todo, echo, settings)).toBe(false)
+
+      const next = request([turn(`t${round}`)])
+      expect(await injectTail(todo, next, settings)).toBe(true)
+      expect(lastText(next)).not.toContain("update it")
+    }
+  })
+
+  test("staleAfter: 0 keeps the informative reminder and drops every nudge", async () => {
+    const { todo } = core()
+    const off = { ...DEFAULT_SETTINGS, staleAfter: 0 }
+
+    const noList = request([turn("m1")])
+    expect(await injectTail(todo, noList, off)).toBe(false)
+
+    await todo.run(SESSION, { action: "add", text: "implement storage" })
+    await injectTail(todo, request([toolResult("a")]), off)
+    await injectTail(todo, request([toolResult("b")]), off)
+    const payload = request([turn("m2")])
+    expect(await injectTail(todo, payload, off)).toBe(true)
+    expect(lastText(payload)).toContain("1 open")
+    expect(lastText(payload)).not.toContain("update it")
+  })
+
+  test("nudges stay on user turns: a tool chain never carries one", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "implement storage" })
+    for (let i = 0; i < 6; i += 1) {
+      const payload = request([toolResult(`step ${i}`)])
+      expect(await injectTail(todo, payload, settings)).toBe(true) // the state line itself
+      expect(lastText(payload)).not.toContain("update it")
+    }
+  })
+
+  test("subagent sessions are never nudged; the informative state line is untouched", async () => {
+    const { todo } = core()
+    const subs = new Set(["explore", "general"])
+    const asAgent = (payload: { messages: unknown[] }, agent: string) => {
+      ;(payload as Record<string, unknown>)["agent"] = agent
+      return payload
+    }
+
+    // A fresh subagent session: the invitation is the only thing it could draw — suppressed.
+    const invite = asAgent(request([turn("m1")]), "explore")
+    expect(await injectTail(todo, invite, settings, subs)).toBe(false)
+    expect(invite.messages.length).toBe(1)
+
+    // With a list, the state line still lands — informative only.
+    await todo.run(SESSION, { action: "add", text: "implement storage" })
+    const state = asAgent(request([turn("m1")]), "general")
+    expect(await injectTail(todo, state, settings, subs)).toBe(true)
+    expect(lastText(state)).toContain("1 open")
+    expect(lastText(state)).not.toContain("update it")
+
+    // Even a stale turn start cannot fire the clause inside a subagent.
+    await injectTail(todo, request([toolResult("a")]), settings, subs)
+    await injectTail(todo, request([toolResult("b")]), settings, subs)
+    const stale = asAgent(request([turn("m2")]), "explore")
+    expect(await injectTail(todo, stale, settings, subs)).toBe(true)
+    expect(lastText(stale)).not.toContain("update it")
+
+    // A primary agent on the same cadence: the clause is back.
+    const primary = asAgent(request([turn("m3")]), "build")
+    expect(await injectTail(todo, primary, settings, subs)).toBe(true)
+    expect(lastText(primary)).toContain("update it if it changed")
+
+    // No set handed in (an older caller): behaviour is exactly as before.
+    const legacy = request([turn("m1")], "ses_legacyagent000000000")
+    asAgent(legacy, "explore")
+    expect(await injectTail(todo, legacy, settings)).toBe(true)
+    expect(lastText(legacy)).toContain("no list yet")
+  })
+
+  test("turn-start detection reads the host tail, skipping a message this plugin injected", async () => {
+    const { todo } = core()
+    // A custom creation nudge without the `[focus_todo]` marker passes the dedup
+    // guard, so this isolates the tail-skip: below the injected message is a tool
+    // result, which is not a turn start, so no invitation may fire.
+    const custom = { ...DEFAULT_SETTINGS, staleAfter: 2, creationNudge: "consider recording a plan" }
+    const payload = request([
+      toolResult("m1"),
+      { id: "focus-todo-abc123", role: "user", content: [{ type: "text", text: "consider recording a plan" }], metadata: {} },
+    ])
+    expect(await injectTail(todo, payload, custom)).toBe(false)
+    expect(payload.messages.length).toBe(2)
+
+    // Without the tail, the same request behaves identically.
+    const plain = request([toolResult("m1")])
+    expect(await injectTail(todo, plain, custom)).toBe(false)
+  })
+
+  test("the clause is inside the budget, not bolted on top of it", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "implement " + "z".repeat(100) })
+    const tight = { ...DEFAULT_SETTINGS, reminderBudget: 120, staleAfter: 0 }
+    const payload = request([turn("m1")])
+    expect(await injectTail(todo, payload, { ...tight, staleAfter: 1 })).toBe(true)
+    expect(lastText(payload)).toContain("update it if it changed")
+    // The whole appended message — state line plus clause — honours the budget.
+    expect(JSON.parse(lastText(payload))[0].text.length).toBeLessThanOrEqual(120)
+  })
+
+  test("itemChars controls the per-item clip, and a session with a list is never invited", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "implement the storage layer properly" })
+    const narrow = { ...DEFAULT_SETTINGS, itemChars: 20, staleAfter: 0 }
+    const payload = request([turn("m1")])
+    await injectTail(todo, payload, narrow)
+    expect(lastText(payload)).toContain("implement the stora") // 19 characters plus the ellipsis
+    expect(lastText(payload)).toContain("\u2026")
+  })
+
+  test("custom nudge texts are the ones that reach the model", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "implement storage" })
+    const chinese = { ...DEFAULT_SETTINGS, maintenanceNudge: " — 列表变了就更新", staleAfter: 0 }
+    const payload = request([turn("m1")])
+    await injectTail(todo, payload, { ...chinese, staleAfter: 1 })
+    expect(lastText(payload)).toContain("列表变了就更新")
+
+    const empty = core()
+    const invite = request([turn("m1")], "ses_custominvite00000000000")
+    await injectTail(empty.todo, invite, { ...DEFAULT_SETTINGS, creationNudge: "记一下计划" })
+    expect(lastText(invite)).toContain("记一下计划")
+  })
+
+  test("a user's own nudge text is never clipped, even when it outgrows the budget", async () => {
+    // The documented contract: `reminderBudget` bounds the *generated* state line, and the
+    // clause is subtracted from it when there is room. A deliberately long custom clause is
+    // the user's own words — used as written, and worst case the appended message ends up
+    // slightly over the budget rather than silently truncated.
+    const long = 300
+    const clause = ` — ${"c".repeat(long - 4)}`
+    const { todo } = core()
+    await todo.run(SESSION, { action: "replace", items: [{ text: "x".repeat(150) }, { text: "y" }] })
+    const payload = request([turn("m1")])
+    await injectTail(todo, payload, { ...DEFAULT_SETTINGS, maintenanceNudge: clause, staleAfter: 1 })
+
+    const last = payload.messages[payload.messages.length - 1] as { content: unknown }
+    const text =
+      typeof last.content === "string"
+        ? last.content
+        : (last.content as Array<{ text?: string }>).map((part) => part.text ?? "").join("")
+    expect(text.endsWith(clause)).toBe(true) // whole clause, untouched
+    const settings = resolveSettings({ maintenanceNudge: clause }, {})
+    expect(settings.maintenanceNudge).toBe(clause)
+    const worst = DEFAULT_SETTINGS.reminderBudget - 80 + settings.maintenanceNudge.length
+    expect(text.length).toBeLessThanOrEqual(worst)
+    expect(text.length).toBeLessThan(400) // and still bounded by constants, not by user input size
+  })
+})
+
+describe("settings", () => {
+  test("defaults to the reminder on with a bounded budget", () => {
+    expect(resolveSettings(undefined, {})).toEqual(DEFAULT_SETTINGS)
+    expect(DEFAULT_SETTINGS.reminder).toBe(true)
+    expect(DEFAULT_SETTINGS.reminderBudget).toBe(360)
+    expect(DEFAULT_SETTINGS.staleAfter).toBe(6)
+    expect(DEFAULT_SETTINGS.itemChars).toBe(48)
+    expect(DEFAULT_SETTINGS.maintenanceNudge).toContain("update it")
+    expect(DEFAULT_SETTINGS.creationNudge).toContain("no list yet")
+    // The invitation offers the tool; it does not order a call.
+    expect(DEFAULT_SETTINGS.creationNudge).not.toContain("replace")
+    expect(DEFAULT_SETTINGS.creationNudge.length).toBeLessThan(120)
+  })
+
+  test("reads the JSON file shape, tolerating junk keys and types", () => {
+    expect(resolveSettings({ reminder: false, reminderBudget: 500, staleAfter: 4 }, {})).toEqual({
+      ...DEFAULT_SETTINGS,
+      reminder: false,
+      reminderBudget: 500,
+      staleAfter: 4,
+    })
+    expect(resolveSettings({ reminder: "nonsense", extra: 1 }, {})).toEqual(DEFAULT_SETTINGS)
+    expect(resolveSettings([1, 2, 3], {})).toEqual(DEFAULT_SETTINGS)
+  })
+
+  test("clamps the budget so a typo cannot flood the context", () => {
+    expect(resolveSettings({ reminderBudget: 5 }, {}).reminderBudget).toBe(80)
+    expect(resolveSettings({ reminderBudget: 99999 }, {}).reminderBudget).toBe(2000)
+    expect(resolveSettings({ reminderBudget: "420" }, {}).reminderBudget).toBe(420)
+    expect(resolveSettings({ reminderBudget: "wide" }, {}).reminderBudget).toBe(360)
+  })
+
+  test("clamps the nudge interval, and 0 means never", () => {
+    expect(resolveSettings({ staleAfter: 0 }, {}).staleAfter).toBe(0)
+    expect(resolveSettings({ staleAfter: -3 }, {}).staleAfter).toBe(0)
+    expect(resolveSettings({ staleAfter: 9999 }, {}).staleAfter).toBe(200)
+    expect(resolveSettings({ staleAfter: "3" }, {}).staleAfter).toBe(3)
+    expect(resolveSettings({ staleAfter: "soon" }, {}).staleAfter).toBe(6)
+  })
+
+  test("clamps the item clip, and the retired invitation cap is inert", () => {
+    expect(resolveSettings({ itemChars: 1 }, {}).itemChars).toBe(16)
+    expect(resolveSettings({ itemChars: 9999 }, {}).itemChars).toBe(200)
+    expect(resolveSettings({ itemChars: 24 }, {}).itemChars).toBe(24)
+    // `creationNudgeMax` used to be a per-session cap. The invitation is no longer
+    // rationed at all, so the key is now a tolerated unknown rather than a setting —
+    // a file that still has it resolves to the defaults instead of shrinking a cap.
+    expect(resolveSettings({ creationNudgeMax: 0 }, {})).toEqual(DEFAULT_SETTINGS)
+    expect(resolveSettings({ creationNudgeMax: 50 }, {})).toEqual(DEFAULT_SETTINGS)
+  })
+
+  test("nudge texts are configurable, trimmed, capped, and empty falls back", () => {
+    const custom = resolveSettings({ maintenanceNudge: "  — 列表变了就更新  ", creationNudge: "记一下计划" }, {})
+    // The leading space survives (it separates the clause from the list); the
+    // trailing one does not.
+    expect(custom.maintenanceNudge).toBe("  — 列表变了就更新")
+    expect(custom.creationNudge).toBe("记一下计划")
+
+    expect(resolveSettings({ maintenanceNudge: "   " }, {}).maintenanceNudge).toBe(DEFAULT_SETTINGS.maintenanceNudge)
+    expect(resolveSettings({ creationNudge: 42 }, {}).creationNudge).toBe(DEFAULT_SETTINGS.creationNudge)
+
+    const flood = resolveSettings({ creationNudge: "x".repeat(5000) }, {}).creationNudge
+    expect(flood.length).toBe(300)
+  })
+
+  test("the environment overrides the file, for tests and one-off runs", () => {
+    expect(resolveSettings({ reminder: false }, { FOCUS_TODO_REMINDER: "1" }).reminder).toBe(true)
+    expect(resolveSettings({ reminder: true }, { FOCUS_TODO_REMINDER: "0" }).reminder).toBe(false)
+    expect(resolveSettings({ reminderBudget: 100 }, { FOCUS_TODO_REMINDER_BUDGET: "900" }).reminderBudget).toBe(900)
+    expect(resolveSettings({ staleAfter: 9 }, { FOCUS_TODO_STALE_AFTER: "2" }).staleAfter).toBe(2)
+    expect(resolveSettings({ itemChars: 100 }, { FOCUS_TODO_ITEM_CHARS: "20" }).itemChars).toBe(20)
+    expect(resolveSettings({ staleAfter: 9 }, { FOCUS_TODO_STALE_AFTER: "0" }).staleAfter).toBe(0)
+  })
+
+  test("finds the config file next to the user's opencode.json", () => {
+    expect(userConfigPath({ HOME: "/home/me" })).toBe("/home/me/.config/opencode/focus-todo.json")
+    expect(userConfigPath({ USERPROFILE: "C:\\Users\\me" })).toBe("C:\\Users\\me/.config/opencode/focus-todo.json")
+    expect(userConfigPath({ XDG_CONFIG_HOME: "/xdg", HOME: "/home/me" })).toBe("/xdg/opencode/focus-todo.json")
+    expect(userConfigPath({})).toBeUndefined()
+  })
+
+  test("a missing or unreadable config file resolves to the defaults", async () => {
+    expect(await loadSettings({}, ["C:/definitely/not/here/focus-todo.json"])).toEqual(DEFAULT_SETTINGS)
+    expect(await loadSettings({}, [undefined])).toEqual(DEFAULT_SETTINGS)
+  })
+})
