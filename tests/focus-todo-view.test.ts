@@ -9,7 +9,7 @@
 import { describe, expect, test } from "bun:test"
 
 import { applyAction, emptyState, formatReminder, formatState, MAX_DONE, MAX_ITEMS, type TodoState } from "../src/focus-todo/server.ts"
-import { MAX_DONE_ROWS, MAX_OPEN_ROWS, MAX_ROW_WIDTH, MAX_ROWS, MESSAGE_SCAN_LIMIT, TOOL_NAME, buildPanel, charWidth, clip, displayWidth, extractFocusState, isFoldStorePair, latestFocusState, parseFocusState, type FocusView, reminderStatus, newestIsOwnResult, toHex } from "../src/focus-todo/view.ts"
+import { MAX_DONE_ROWS, MAX_OPEN_ROWS, MAX_ROW_WIDTH, MAX_ROWS, MESSAGE_SCAN_LIMIT, TOOL_NAME, buildPanel, charWidth, clip, displayWidth, extractFocusState, isFoldStorePair, latestFocusState, parseFocusState, type FocusView, toHex } from "../src/focus-todo/view.ts"
 
 const SESSION = "ses_view0000aaaaaaaaaaaaaaaaaaaaa"
 
@@ -279,11 +279,11 @@ describe("buildPanel", () => {
   })
 
   test("says 暂无待办 until the session has used the tool", () => {
-    expect(buildPanel(undefined)).toEqual({ header: "暂无待办", status: "", rows: [] })
+    expect(buildPanel(undefined)).toEqual({ header: "暂无待办", rows: [] })
   })
 
   test("says 暂无待办 for a list that was cleared before anything finished", () => {
-    expect(buildPanel(view(0, 0))).toEqual({ header: "暂无待办", status: "", rows: [] })
+    expect(buildPanel(view(0, 0))).toEqual({ header: "暂无待办", rows: [] })
   })
 
   test("shows all done plus the marked rows once nothing is open", () => {
@@ -305,51 +305,15 @@ describe("buildPanel", () => {
     // is the true state and the only thing there is to draw.
     expect(buildPanel({ active: 0, done: 1, items: [] })).toEqual({
       header: "Focus 0 active, done 1",
-      status: "",
       rows: [],
     })
 
-    const withStatus = buildPanel({ active: 0, done: 12, items: [] }, 30, "未提醒")
-    expect(withStatus.header).toBe("Focus 0 active, done 12")
-    expect(withStatus.status).toBe("未提醒")
+    expect(buildPanel({ active: 0, done: 12, items: [] }, 30).header).toBe("Focus 0 active, done 12")
 
     // The same string the tool result carries, parsed and drawn without a special case.
     expect(buildPanel(parseFocusState("0 active, done=1"))?.header).toBe("Focus 0 active, done 1")
     // And it still respects the width budget of a narrow sidebar.
     expect(buildPanel({ active: 0, done: 3, items: [] }, 10).header).toBe("Focus 0 a…")
-  })
-
-  test("carries the reminder status line through", () => {
-    const done = buildPanel(view(0, 0), 30, "未提醒")
-    expect(done.status).toBe("未提醒")
-    const working = buildPanel(view(1, 0), 30, "已提醒待办")
-    expect(working.status).toBe("已提醒待办")
-  })
-
-  test("the reminder line reports only what the window can prove", () => {
-    const own = [assistantMessage([toolPart("2 active, done=1\nt1:> a\nt2:- b")])]
-    const parsed = latestFocusState(own)
-    // The newest message already is the tool result → the dedup guard silences the reminder.
-    expect(reminderStatus(own, parsed)).toBe("未提醒")
-
-    // A newer user message means the next request carries the state line.
-    const afterUser = [...own, { role: "user", content: "next" }]
-    expect(reminderStatus(afterUser, parsed)).toBe("已提醒待办")
-
-    // Nothing open → nothing is appended (and the invitation is a server-side counter we
-    // deliberately do not guess).
-    const idle = { active: 0, done: 3, items: [{ id: "t1", status: "done" as const, text: "x" }] }
-    expect(reminderStatus(own, idle)).toBe("未提醒")
-    // No list at all → the header already says 暂无待办, so no second line.
-    expect(reminderStatus(own, undefined)).toBe("")
-  })
-
-  test("newestIsOwnResult looks only at the newest message", () => {
-    const older = [assistantMessage([toolPart("1 active, done=0\nt1:> a")]), { role: "user", content: "hi" }]
-    expect(newestIsOwnResult(older)).toBe(false)
-    expect(newestIsOwnResult([...older, assistantMessage([toolPart("1 active, done=0\nt1:> a")])])).toBe(true)
-    expect(newestIsOwnResult([])).toBe(false)
-    expect(newestIsOwnResult("junk")).toBe(false)
   })
 
   test("renders a header plus one row per open item", () => {

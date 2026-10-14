@@ -15,11 +15,8 @@
  * the session. It writes nothing anywhere: the tool remains the single source of
  * truth, and a missing or unparsable result simply renders `暂无待办`.
  *
- * Besides the list it renders one status line saying what the plugin last told
- * the model (`已提醒待办` / `未提醒`), derived from the session window only. The
- * nudge variants (`已提醒更新待办`, `已提醒是否使用待办`) depend on server-side
- * counters the TUI half cannot see, so they are deliberately not invented here —
- * see IMPLEMENTATION_NOTES.md §9.17.
+ * The panel deliberately renders facts only. Reminder delivery is a request-tail
+ * concern owned by the server half and is not exposed as a guessed status line.
  */
 
 /** Must match `server.ts` — the tool result is the data source. */
@@ -59,8 +56,6 @@ export interface PanelRow {
 
 export interface Panel {
   readonly header: string
-  /** What the plugin last told the model, or empty when the window cannot say. */
-  readonly status: string
   readonly rows: readonly PanelRow[]
 }
 
@@ -226,32 +221,6 @@ export function toHex(raw: unknown): string | undefined {
 }
 
 /**
- * Whether the newest message in the window already is a `focus_todo` result — the
- * exact case the server's dedup guard silences, so the reminder is not appended.
- */
-export function newestIsOwnResult(messages: unknown): boolean {
-  if (!Array.isArray(messages) || messages.length === 0) return false
-  const newest: unknown = messages[messages.length - 1]
-  const content = isRecord(newest) ? newest["content"] : undefined
-  if (!Array.isArray(content)) return false
-  return content.some((part) => extractFocusState(part) !== undefined)
-}
-
-/**
- * The panel's reminder line, from the session window only.
- *
- *  - no list, or nothing left open → empty (either nothing is appended, or the
- *    window cannot prove what was);
- *  - the tail already is the tool result → `未提醒` (the dedup guard);
- *  - otherwise, with open items → `已提醒待办`.
- */
-export function reminderStatus(messages: unknown, view: FocusView | undefined): string {
-  if (view === undefined || (view.active === 0 && view.done === 0)) return ""
-  if (newestIsOwnResult(messages)) return "未提醒"
-  return view.active > 0 ? "已提醒待办" : "未提醒"
-}
-
-/**
  * Build what the panel shows.
  *
  *  - no state known, or nothing to show → one line, `暂无待办`
@@ -261,7 +230,7 @@ export function reminderStatus(messages: unknown, view: FocusView | undefined): 
  *    would read like a rendering bug)
  *  - otherwise                          → the counts plus every row, marked rows last
  */
-export function buildPanel(view: FocusView | undefined, width: number = MAX_ROW_WIDTH, status = ""): Panel {
+export function buildPanel(view: FocusView | undefined, width: number = MAX_ROW_WIDTH): Panel {
   const rowsOf = (items: readonly ViewItem[]): PanelRow[] =>
     items.slice(0, MAX_ROWS).map((item) => ({
       status: item.status,
@@ -269,18 +238,17 @@ export function buildPanel(view: FocusView | undefined, width: number = MAX_ROW_
     }))
 
   if (view === undefined || (view.active === 0 && view.done === 0)) {
-    return { header: clip("暂无待办", width), status, rows: [] }
+    return { header: clip("暂无待办", width), rows: [] }
   }
 
   if (view.active === 0) {
-    if (view.items.length > 0) return { header: "Focus: all done", status, rows: rowsOf(view.items) }
-    return { header: clip(`Focus 0 active, done ${view.done}`, width), status, rows: [] }
+    if (view.items.length > 0) return { header: "Focus: all done", rows: rowsOf(view.items) }
+    return { header: clip(`Focus 0 active, done ${view.done}`, width), rows: [] }
   }
 
   const suffix = view.done > 0 ? `, done ${view.done}` : ""
   return {
     header: clip(`Focus ${view.active} active${suffix}`, width),
-    status,
     rows: rowsOf(view.items),
   }
 }

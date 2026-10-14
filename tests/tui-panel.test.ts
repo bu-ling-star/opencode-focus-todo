@@ -212,16 +212,11 @@ describe("panel rendering", () => {
     plugin.setup(context)
 
     const tree = claims[0]?.render({ sessionID: SESSION })
-    expect(renderText(tree)).toEqual(["▼ Focus 2 active, done 1", "未提醒", "▶ t1 implement storage", "○ t2 add tests"])
+    expect(renderText(tree)).toEqual(["▼ Focus 2 active, done 1", "▶ t1 implement storage", "○ t2 add tests"])
 
-    // A newer user message means the next request carries the reminder line.
+    // A newer user message changes server-side request context, not the facts shown here.
     conversation.push({ role: "user", content: "go on" })
-    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual([
-      "▼ Focus 2 active, done 1",
-      "已提醒待办",
-      "▶ t1 implement storage",
-      "○ t2 add tests",
-    ])
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ Focus 2 active, done 1", "▶ t1 implement storage", "○ t2 add tests"])
   })
 
   test("renders the count when nothing is open and no rows are left", () => {
@@ -232,7 +227,7 @@ describe("panel rendering", () => {
 
     // The marks were removed one by one, so there is nothing to list; `all done` over an
     // empty body would read like a rendering bug, so the count is stated instead.
-    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ Focus 0 active, done 4", "未提醒"])
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ Focus 0 active, done 4"])
   })
 
   test("renders all done plus the marked rows while they are still there", () => {
@@ -245,7 +240,6 @@ describe("panel rendering", () => {
 
     expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual([
       "▼ Focus: all done",
-      "未提醒",
       "✓ t2 add tests",
       "✓ t1 implement storage",
     ])
@@ -277,10 +271,9 @@ describe("panel rendering", () => {
     })
     plugin.setup(context)
 
-    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ Focus 1 active", "未提醒", "▶ t1 mine"])
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ Focus 1 active", "▶ t1 mine"])
     expect(renderText(claims[0]?.render({ sessionID: "ses_other0000bbbbbbbbbbbbbbbbbbbbb" }))).toEqual([
       "▼ Focus 0 active, done 2",
-      "未提醒",
     ])
   })
 
@@ -311,7 +304,7 @@ describe("panel rendering", () => {
     plugin.setup({ ...context, renderer: { terminalWidth: 60 } } as never)
 
     const lines = renderText(claims[0]?.render({ sessionID: SESSION }))
-    expect(lines).toHaveLength(3)
+    expect(lines).toHaveLength(2)
     // terminalWidth 60 → row budget 60/3-2 = 18 columns; every line honours it.
     for (const line of lines) expect(line.length).toBeLessThanOrEqual(18)
   })
@@ -337,11 +330,10 @@ describe("panel rendering", () => {
       }
     }
     walk(claims[0]?.render({ sessionID: SESSION }))
-    // Header, reminder status, then the three rows — done recedes, pending is plain
+    // Header, then the three rows — done recedes, pending is plain
     // text colour, in-progress is success green, blocked is error red.
     expect(collected).toEqual([
       THEME.text.base,
-      THEME.text.muted,
       THEME.text.feedback.success.base,
       THEME.text.base,
       THEME.text.feedback.error.base,

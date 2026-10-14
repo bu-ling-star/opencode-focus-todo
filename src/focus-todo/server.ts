@@ -40,23 +40,33 @@ export interface TodoState {
 }
 
 /**
- * One mutation inside a `batch`. The allowed set is every mutating action minus
- * `batch` itself — a batch is atomic, so nesting one inside another would only
- * add a second way to say the same thing.
+ * One local mutation inside `mutate`. Keeping this set small makes the public
+ * tool contract easy to remember: replace a plan, or mutate existing rows.
  */
-export type BatchOp =
-  | { action: "replace"; items: Array<{ id?: string; text: string; status?: TodoStatus }> }
+export type MutationOp =
   | { action: "add"; text: string; status?: TodoStatus }
   | { action: "update"; id: string; text?: string; status?: TodoStatus; done?: true }
   | { action: "remove"; id: string }
 
+/** Accepted only for old `batch` calls; it is intentionally absent from the schema. */
+export type LegacyBatchOp = MutationOp | { action: "replace"; items: Array<{ id?: string; text: string; status?: TodoStatus }> }
+
+/** @deprecated Use `MutationOp`; retained so old integrations can still type-check. */
+export type BatchOp = LegacyBatchOp
+
 export type FocusTodoInput =
   | { action: "list" }
   | { action: "replace"; items: Array<{ id?: string; text: string; status?: TodoStatus }> }
+  | { action: "mutate"; ops: MutationOp[] }
+
+/** Old inputs remain executable, but are not advertised to the model. */
+export type LegacyFocusTodoInput =
   | { action: "add"; text: string; status?: TodoStatus }
   | { action: "update"; id: string; text?: string; status?: TodoStatus; done?: true }
   | { action: "remove"; id: string }
-  | { action: "batch"; ops: BatchOp[] }
+  | { action: "batch"; ops: LegacyBatchOp[] }
+  | { action: "complete"; id: string }
+  | { action: "clear" }
 
 /** Subset of `context.storage` that this plugin relies on. */
 export interface Storage {
@@ -81,7 +91,7 @@ export const MAX_ITEMS = 16
 /** Marked items kept per session; the oldest ones are dropped once this is exceeded. */
 export const MAX_DONE = 16
 export const MAX_TEXT = 150
-/** Upper bound on one batch call: a plan holds at most 16 open items, so 24 ops covers any realistic reshuffle. */
+/** Upper bound on one mutation envelope: a plan holds at most 16 open items, so 24 ops covers any realistic reshuffle. */
 export const MAX_BATCH_OPS = 24
 /** Done rows appear in every tool result, so their text is clipped harder than an open item. */
 export const DONE_TEXT_MAX = 24
@@ -93,7 +103,7 @@ export const KEY_PREFIX = "focus-todo/session/"
  *   <config>/opencode/focus-todo.json      (~/.config/opencode/focus-todo.json)
  *   <plugin dir>/focus-todo.json           (fallback, next to server.ts)
  *
- * Shape: `{ "reminder": true, "reminderBudget": 360, "staleAfter": 10 }`. Missing file,
+ * Shape: `{ "reminder": true, "reminderBudget": 360, "staleAfter": 0 }`. Missing file,
  * missing key, wrong type or broken JSON all fall back to the defaults below, so the
  * plugin can never be configured into a broken state. The environment variables of the
  * same names are honoured as an override for tests and one-off runs.
@@ -120,16 +130,12 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
   reminder: true,
   reminderBudget: 360,
-  // 10 quiet requests before the next nudge, and only at a user turn start: the
-  // wire showed the nudge being read as the *user* speaking, so it fires rarely
-  // on purpose — an ignored list still re-surfaces, just at a slow cadence.
-  staleAfter: 10,
+  // Disabled by default: the normal reminder is enough once a plan exists, and
+  // an empty session should not be invited to create bookkeeping.
+  staleAfter: 0,
   itemChars: 48,
-  // "automated" tells the model this line is the plugin speaking, not the user:
-  // the reminder rides in as a user-role message, which models otherwise read
-  // as the user asking (observed in the wild: "用户提醒我待办" in thinking).
-  maintenanceNudge: " — automated reminder, update it if it changed",
-  creationNudge: '[focus_todo] automated reminder — no list yet; focus_todo is available if you want to record a plan',
+  maintenanceNudge: " — update if changed",
+  creationNudge: "[focus_todo] no list yet",
 }
 
 const REMINDER_BUDGET_MIN = 80
@@ -243,12 +249,9 @@ export async function loadSettings(
 }
 
 export const TOOL_DESCRIPTION =
-  'Working state for this session, and the only tracked plan. Call focus_todo(action="list") when ' +
-  "you start or resume work, after a compaction, or after a restart. Record a multi-step plan with " +
-  'action="replace"; skip the list for a single trivial step. Keep items to a few words, at most one ' +
-  "in_progress, and update the list the moment an item finishes, blocks, or changes scope. When several " +
-  'items change together, send ONE batch (action="batch" with ops) instead of repeated calls. Anything ' +
-  "not in this list is not tracked."
+  'Session focus list for multi-step work. For 3+ steps, start with action="replace"; skip trivial work. ' +
+  'Use action="list" on resume/compaction/restart, or action="mutate" with 1–24 add/update/remove ops. ' +
+  'Keep items short; set one in_progress before work; set done:true only after verification, leaving partial, blocked, or failing work open.'
 
 const STATUSES: readonly TodoStatus[] = ["pending", "in_progress", "blocked"]
 const MARK: Record<TodoStatus, string> = { in_progress: ">", pending: "-", blocked: "!" }
@@ -260,34 +263,17 @@ export const INPUT_SCHEMA = {
   properties: {
     action: {
       type: "string",
-      enum: ["list", "replace", "add", "update", "remove", "batch"],
-      description:
-        "list: read. replace: overwrite all (empty clears). add: append one. update: edit text/status, or mark done with done:true. remove: drop one. batch: ops in order, all-or-nothing.",
-    },
-    text: {
-      type: "string",
-      description: `Item text, max ${MAX_TEXT} chars. Required for add, optional for update/replace.`,
-    },
-    id: {
-      type: "string",
-      description: "Item id (e.g. t3). Required for update, remove.",
-    },
-    status: {
-      type: "string",
-      enum: ["pending", "in_progress", "blocked"],
-      description: "Defaults to pending; at most one item in_progress.",
-    },
-    done: {
-      type: "boolean",
-      description: "For update: true marks the item done (kept as an x row); only true is supported.",
+      enum: ["list", "replace", "mutate"],
+      description: "list: read. replace: overwrite all. mutate: apply add/update/remove ops atomically.",
     },
     items: {
       type: "array",
-      description: "Required for replace: the full new list.",
+      description: "For replace: new plan; [] clears rows and done count.",
+      maxItems: MAX_ITEMS,
       items: {
         type: "object",
         properties: {
-          id: { type: "string", description: "Existing id to keep; omit for a new one." },
+          id: { type: "string", description: "Existing id to keep; omit for a new id." },
           text: { type: "string", description: `Item text, max ${MAX_TEXT} chars.` },
           status: { type: "string", enum: ["pending", "in_progress", "blocked"] },
         },
@@ -297,33 +283,21 @@ export const INPUT_SCHEMA = {
     },
     ops: {
       type: "array",
-      description: `Required for batch: 1–${MAX_BATCH_OPS} mutations, applied in order, all-or-nothing (one bad op rejects the whole batch).`,
+      description: `For mutate: 1–${MAX_BATCH_OPS} ops, applied in order, all-or-nothing.`,
+      minItems: 1,
+      maxItems: MAX_BATCH_OPS,
       items: {
         type: "object",
         properties: {
           action: {
             type: "string",
-            enum: ["replace", "add", "update", "remove"],
-            description: "list and batch are not allowed inside ops.",
+            enum: ["add", "update", "remove"],
+            description: "One local mutation; replace is top-level only.",
           },
-          text: { type: "string", description: `For add/update ops: item text, max ${MAX_TEXT} chars.` },
-          id: { type: "string", description: "For update/remove ops: the item id." },
+          text: { type: "string", description: `For add/update: max ${MAX_TEXT} chars.` },
+          id: { type: "string", description: "For update/remove." },
           status: { type: "string", enum: ["pending", "in_progress", "blocked"] },
-          done: { type: "boolean", description: "For update ops: true marks the item done." },
-          items: {
-            type: "array",
-            description: "For replace ops: the full new list.",
-            items: {
-              type: "object",
-              properties: {
-                id: { type: "string" },
-                text: { type: "string" },
-                status: { type: "string", enum: ["pending", "in_progress", "blocked"] },
-              },
-              required: ["text"],
-              additionalProperties: false,
-            },
-          },
+          done: { type: "boolean", enum: [true], description: "For update: marks done; retained as a row." },
         },
         required: ["action"],
         additionalProperties: false,
@@ -522,7 +496,7 @@ const ATTENTION_RANK: Record<TodoStatus, number> = { in_progress: 0, blocked: 1,
  * each outbound request. `undefined` when there is nothing open: a session that
  * is not using the tool pays zero tokens and shows no sign of this plugin.
  *
- * The line is bounded, because it is re-sent on every request, and it is ordered
+ * The line is bounded, because it is re-sent at eligible user-turn starts, and it is ordered
  * by attention rather than by list order: the in-progress item first, then
  * blocked ones, then the rest in their original order. When the budget runs out
  * the remainder is stated as `+k more` instead of being silently cut, so the
@@ -533,7 +507,7 @@ export function formatReminder(
   budget: number = DEFAULT_SETTINGS.reminderBudget,
   itemChars: number = DEFAULT_SETTINGS.itemChars,
 ): string | undefined {
-  // Marked items are deliberately absent here: this line is re-sent on every request and the
+  // Marked items are deliberately absent here: this line is re-sent at eligible user-turn starts and the
   // model only needs what is still open (the header still carries the `done` count).
   const open = openItems(state)
   if (open.length === 0) return undefined
@@ -570,7 +544,7 @@ function fail(error: string): ActionFailure {
  * Pure state transition: no IO, no clock, no randomness, so it is exhaustively
  * testable and every result is reproducible.
  */
-export function applyAction(state: TodoState, input: FocusTodoInput): ActionOutcome {
+export function applyAction(state: TodoState, input: FocusTodoInput | LegacyFocusTodoInput): ActionOutcome {
   const action = (input as { action?: unknown } | null | undefined)?.action
 
   switch (action) {
@@ -622,6 +596,9 @@ export function applyAction(state: TodoState, input: FocusTodoInput): ActionOutc
       const next = clone(state, capped(items), { nextId, completed: 0 })
       return { ok: true, state: next, text: formatState(next), write: true }
     }
+
+    case "mutate":
+      return applyMutationOps(state, (input as { ops?: unknown }).ops, false, "mutate")
 
     case "add": {
       if (openItems(state).length >= MAX_ITEMS) return fail(`too many items (max ${MAX_ITEMS})`)
@@ -705,56 +682,74 @@ export function applyAction(state: TodoState, input: FocusTodoInput): ActionOutc
       return { ok: true, state: next, text: formatState(next), write: true }
     }
 
-    case "batch": {
-      const raw = (input as { ops?: unknown }).ops
-      if (!Array.isArray(raw)) return fail("ops must be an array")
-      if (raw.length === 0) return fail("ops is empty")
-      if (raw.length > MAX_BATCH_OPS) return fail(`too many ops (max ${MAX_BATCH_OPS})`)
+    case "batch":
+      // Backward compatibility for callers that still send the old envelope.
+      return applyMutationOps(state, (input as { ops?: unknown }).ops, true, "batch")
 
-      // Atomic by construction: every op is applied to a throwaway draft in order;
-      // a single failure rejects the whole batch, so the stored state never sees a
-      // half-applied plan. All failures are reported at once, so one retry can
-      // correct every mistake instead of discovering them one call at a time.
-      let draft = state
-      const errors: string[] = []
-      for (let index = 0; index < raw.length; index += 1) {
-        const op = raw[index]
-        const label = `op ${index + 1}`
-        if (typeof op !== "object" || op === null || Array.isArray(op)) {
-          errors.push(`${label}: must be an object`)
-          continue
-        }
-        const action = (op as { action?: unknown }).action
-        if (action === "batch") {
-          errors.push(`${label}: nested batch not allowed`)
-          continue
-        }
-        if (action === "list") {
-          errors.push(`${label}: list is pointless inside a batch (the result shows the final state)`)
-          continue
-        }
-        const outcome = applyAction(draft, op as FocusTodoInput)
-        if (!outcome.ok) {
-          errors.push(`${label}: ${outcome.error}`)
-          continue
-        }
-        draft = outcome.state
-      }
-      if (errors.length > 0) {
-        const shown = errors.slice(0, 4).join("; ")
-        const rest = errors.length > 4 ? `; +${errors.length - 4} more` : ""
-        return fail(`batch rejected, ${errors.length} of ${raw.length} ops failed: ${shown}${rest}`)
-      }
-      return { ok: true, state: draft, text: formatState(draft), write: true }
-    }
+    case "complete":
+      return applyAction(state, { action: "update", id: (input as { id: string }).id, done: true })
+
+    case "clear":
+      return applyAction(state, { action: "replace", items: [] })
 
     default:
-      return fail(`unknown action (use list|replace|add|update|remove|batch)`)
+      return fail(`unknown action (use list|replace|mutate)`)
   }
 }
 
+/** Apply a mutation envelope atomically. `allowReplace` exists only for old `batch` calls. */
+function applyMutationOps(state: TodoState, raw: unknown, allowReplace: boolean, envelope: "mutate" | "batch"): ActionOutcome {
+  if (!Array.isArray(raw)) return fail("ops must be an array")
+  if (raw.length === 0) return fail("ops is empty")
+  if (raw.length > MAX_BATCH_OPS) return fail(`too many ops (max ${MAX_BATCH_OPS})`)
+
+  let draft = state
+  const errors: string[] = []
+  for (let index = 0; index < raw.length; index += 1) {
+    const op = raw[index]
+    const label = `op ${index + 1}`
+    if (typeof op !== "object" || op === null || Array.isArray(op)) {
+      errors.push(`${label}: must be an object`)
+      continue
+    }
+    const action = (op as { action?: unknown }).action
+    if (action === "replace" && !allowReplace) {
+      errors.push(`${label}: replace must be a top-level action`)
+      continue
+    }
+    if (action === "list") {
+      errors.push(
+        envelope === "batch"
+          ? `${label}: list is pointless inside a batch (the result shows the final state)`
+          : `${label}: list is not allowed inside mutate`,
+      )
+      continue
+    }
+    if (action === "mutate" || action === "batch") {
+      errors.push(envelope === "batch" ? `${label}: nested batch not allowed` : `${label}: ${String(action)} is not allowed inside mutate`)
+      continue
+    }
+    if (action !== "add" && action !== "update" && action !== "remove" && !(allowReplace && action === "replace")) {
+      errors.push(`${label}: unknown op (use add|update|remove)`)
+      continue
+    }
+    const outcome = applyAction(draft, op as FocusTodoInput | LegacyFocusTodoInput)
+    if (!outcome.ok) {
+      errors.push(`${label}: ${outcome.error}`)
+      continue
+    }
+    draft = outcome.state
+  }
+  if (errors.length > 0) {
+    const shown = errors.slice(0, 4).join("; ")
+    const rest = errors.length > 4 ? `; +${errors.length - 4} more` : ""
+    return fail(`${envelope} rejected, ${errors.length} of ${raw.length} ops failed: ${shown}${rest}`)
+  }
+  return { ok: true, state: draft, text: formatState(draft), write: true }
+}
+
 export interface FocusTodo {
-  run(sessionID: unknown, input: FocusTodoInput): Promise<string>
+  run(sessionID: unknown, input: FocusTodoInput | LegacyFocusTodoInput): Promise<string>
   /** Read-only snapshot for the request reminder; never writes, never throws. */
   peek(sessionID: unknown): Promise<TodoState | undefined>
   /** Diagnostic only: how many sessions currently hold an unfinished mutation chain. */
@@ -793,7 +788,7 @@ export function createFocusTodo(storage: Storage, log: Logger | undefined = host
     return result
   }
 
-  async function handle(sessionID: unknown, input: FocusTodoInput): Promise<string> {
+  async function handle(sessionID: unknown, input: FocusTodoInput | LegacyFocusTodoInput): Promise<string> {
     const key = sessionKey(sessionID)
     if (key === undefined) return "error=invalid session id"
 
@@ -826,6 +821,7 @@ export function createFocusTodo(storage: Storage, log: Logger | undefined = host
         }
       }
 
+      resetNudgeCadence(key)
       return notice + outcome.text
     })
   }
@@ -853,9 +849,9 @@ const MEMO_LIMIT = 512
  * fresh process should have anyway.
  */
 interface SessionMemo {
-  /** We have handled a request for this session before. */
-  known: boolean
-  /** Requests (hook calls) since the last one whose tail already showed the list. */
+  /** Most recent user message that received an appended reminder. */
+  lastTurn?: string
+  /** Requests since the last nudge, used only when nudges are explicitly enabled. */
   idle: number
 }
 const memos = new Map<string, SessionMemo>()
@@ -872,6 +868,12 @@ function storeMemo(key: string, value: SessionMemo): void {
     const oldest = memos.keys().next().value
     if (oldest !== undefined) memos.delete(oldest)
   }
+}
+
+function resetNudgeCadence(key: string): void {
+  const memo = recallMemo(key)
+  if (memo === undefined) return
+  storeMemo(key, { ...memo, idle: 0 })
 }
 
 /**
@@ -904,15 +906,11 @@ function lastHostRoleIsUser(messages: unknown[]): boolean {
  * message and is never written back to the session — so the transcript stays
  * append-only, the reusable cache prefix (system prompt, tool definitions, all
  * earlier messages) keeps its exact bytes, and the reminder is regenerated from
- * storage on every request, which is what makes it survive a compaction.
+ * storage at eligible user-turn starts, which is what makes it survive a compaction.
  *
- * The informative reminder gains something in two cases, both gated on a user turn
- * start — the moment a new instruction is read and the only moment where a nudge is
- * worth its tokens: a list that has gone `settings.staleAfter` requests without being
- * touched gains "update it if it changed", and a session that still has no list at all
- * is told that the tool is available. Neither is rationed: both come back on the same
- * cadence for as long as the situation lasts, because a fired nudge resets the counter
- * that would otherwise grow forever.
+ * The informative reminder is added once at the start of a user turn. Tool and assistant
+ * continuations return before storage access. Optional nudge cadence is updated in memory
+ * only, and remains disabled by the shipped `staleAfter: 0` default.
  *
  * Best-effort by construction: any missing field or unexpected shape means no
  * reminder, never a failed request.
@@ -932,126 +930,61 @@ export async function injectTail(
 ): Promise<boolean> {
   try {
     if (!settings.reminder) return false
-    if (typeof payload !== "object" || payload === null) return false
-    const request = payload as { sessionID?: unknown; messages?: unknown; agent?: unknown }
-    const messages = request.messages
+    const request = asRecord(payload)
+    const messages = request?.messages
     if (!Array.isArray(messages) || messages.length === 0) return false
+    if (!request) return false
+    const key = sessionKey(request.sessionID)
+    if (key === undefined) return false
+    const newest = asRecord(messages[messages.length - 1])
+    if (!newest || isOwnReminderMessage(newest)) return false
+    const nudges = settings.staleAfter > 0
+    const previous = recallMemo(key)
+    const turn = typeof newest.id === "string" ? newest.id : undefined
+    if (turn !== undefined && previous?.lastTurn === turn) return false
 
-    // A reminder is only ever added to the tail, so the tail says whether one is
-    // already there. This makes a second hook registration (plugin reload) inert
-    // instead of appending twice.
-    const lastContent = (messages[messages.length - 1] as { content?: unknown } | undefined)?.content
-    if (containsText(lastContent, `[${TOOL_NAME}]`)) return false
+    // Tool/assistant continuations are not new user turns. With the default
+    // settings this path avoids even reading persistent todo state.
+    if (!lastHostRoleIsUser(messages)) {
+      if (nudges) storeMemo(key, { ...previous, idle: (previous?.idle ?? 0) + 1 })
+      return false
+    }
 
     const state = await todo.peek(request.sessionID)
     if (state === undefined) return false
-
-    const key = sessionKey(request.sessionID)
-    const memo = key === undefined ? undefined : recallMemo(key)
-    const startOfTurn = lastHostRoleIsUser(messages)
-
-    // The newest message already shows this exact state — a tool result the
-    // model produced or consumed a moment ago — so the reminder would only
-    // duplicate it and spend tokens on information that is right there. Only the
-    // whole `N active, done=M` header is matched, so a state whose counters moved
-    // on (a completion, a new item) still gets its reminder.
-    if (containsText(lastContent, stateHeader(state))) {
-      if (key !== undefined) storeMemo(key, { known: true, idle: 0 })
-      return false
-    }
+    const memo = recallMemo(key)
+    if (isOwnReminderMessage(messages[messages.length - 1]) || (turn !== undefined && memo?.lastTurn === turn)) return false
 
     const idle = memo?.idle ?? 0
-    const stale = settings.staleAfter > 0 && idle >= settings.staleAfter
-
-    // A nudge needs a user turn start and nudging switched on, and then either a
-    // session this process has never seen (a long task starting now, or a list
-    // resumed in a new process) or one that has gone `staleAfter` requests
-    // without touching the list. `staleAfter: 0` therefore disables both forms
-    // while leaving the informative reminder alone.
-    //
-    // Neither form is rationed. A session that keeps working without a list hears
-    // about the tool again on the same cadence — a fired nudge resets `idle`, so
-    // the two cannot land in consecutive turns — but there is no lifetime cap on
-    // either the clause or the invitation: an offer that stops coming back is a
-    // deadline, and this line is not one.
-    // A subagent session is short-lived and not where the user's plan lives: both
-    // nudge forms are noise there (the invitation would otherwise open every
-    // explore/general run — measured: the hook payload's `agent` is the agent id
-    // string, "explore"/"general" are subagent-typed, "build"/"plan" primary).
-    // Only a positive identification from the host's agent registry suppresses
-    // them; an unknown agent keeps today's behaviour. The informative state line
-    // is untouched — a subagent that did record a list still sees it.
-    const agentId = request.agent
-    const isSubagent = typeof agentId === "string" && subagents?.has(agentId) === true
-
+    const isSubagent = typeof request.agent === "string" && subagents?.has(request.agent) === true
     let nudge: "create" | "maintain" | undefined
-    if (settings.staleAfter > 0 && startOfTurn && !isSubagent && (memo === undefined || stale)) {
+    if (nudges && !isSubagent && (memo === undefined || idle >= settings.staleAfter)) {
       nudge = state.items.length === 0 ? "create" : "maintain"
     }
-
-    // The state line is generated with the clause already subtracted, so it yields to the
-    // clause instead of quietly overrunning `reminderBudget`. A custom clause longer than
-    // the remaining room is used as written (it is the user's own text, never clipped), so
-    // the appended message can end up a little over the budget — still bounded, because the
-    // clause itself is capped at `NUDGE_TEXT_MAX`.
     const clause = nudge === "maintain" ? settings.maintenanceNudge : ""
-    const line =
-      nudge === "create"
-        ? settings.creationNudge
-        : formatReminder(state, settings.reminderBudget - clause.length, settings.itemChars)
+    const line = nudge === "create" ? settings.creationNudge : formatReminder(state, settings.reminderBudget - clause.length, settings.itemChars)
     if (line === undefined) {
-      if (key !== undefined) storeMemo(key, { known: true, idle: idle + 1 })
+      storeMemo(key, { lastTurn: turn, idle: idle + 1 })
       return false
     }
     const reminder = line + clause
-    // Mirror the shape of the message before it: the host's internal message
-    // model, whose `content` is a parts array in a live session and a string in
-    // a replay. Copying the kind keeps the appended message valid in both.
-    let reference: Record<string, unknown> | undefined
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const candidate = messages[index]
-      if (typeof candidate === "object" && candidate !== null && (candidate as { role?: unknown }).role === "user") {
-        reference = candidate as Record<string, unknown>
-        break
-      }
-    }
-    const content = typeof reference?.["content"] === "string" ? reminder : [{ type: "text", text: reminder }]
     messages.push({
       id: `focus-todo-${Date.now().toString(36)}`,
       role: "user",
-      content,
-      metadata: typeof reference?.["metadata"] === "object" && reference?.["metadata"] !== null ? reference["metadata"] : {},
+      content: typeof newest.content === "string" ? reminder : [{ type: "text", text: reminder }],
+      metadata: asRecord(newest.metadata) ?? {},
     })
-    // Only a fired nudge resets the cadence counter; ordinary state reminders do
-    // not, or a long tool chain (where one is appended on every request) would
-    // reset it forever and no turn would ever look stale.
-    if (key !== undefined) storeMemo(key, { known: true, idle: nudge === undefined ? idle + 1 : 0 })
+    storeMemo(key, { lastTurn: turn, idle: nudge === undefined ? idle + 1 : 0 })
     return true
   } catch {
     return false
   }
 }
 
-/**
- * Does this message content contain `needle` anywhere in it?
- *
- * The message shape is the host's, not ours: a plain string in a replay, a parts
- * array in a live session, and a tool result whose text sits somewhere inside a
- * nested `output` — the exact nesting is not documented, so walk the whole value
- * instead of guessing a field name. Wire-measured: guessing `text`/`content`
- * alone silently missed every tool result, which made the "already on screen"
- * check below a no-op.
- */
-function containsText(value: unknown, needle: string, depth = 0): boolean {
-  if (typeof value === "string") return value.includes(needle)
-  if (depth > 6) return false
-  if (Array.isArray(value)) return value.some((entry) => containsText(entry, needle, depth + 1))
-  if (typeof value === "object" && value !== null) {
-    for (const entry of Object.values(value as Record<string, unknown>)) {
-      if (containsText(entry, needle, depth + 1)) return true
-    }
-  }
-  return false
+function isOwnReminderMessage(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false
+  const message = value as { id?: unknown; role?: unknown }
+  return message.role === "user" && typeof message.id === "string" && message.id.startsWith("focus-todo-")
 }
 
 /** Guards against a double setup (plugin reload) registering two reminders. */
@@ -1115,7 +1048,7 @@ export default {
           input: INPUT_SCHEMA,
           output: OUTPUT_SCHEMA,
           options: { codemode: false },
-          execute: async (input, tool) => ({ output: await todo.run(tool?.sessionID, input as FocusTodoInput) }),
+          execute: async (input, tool) => ({ output: await todo.run(tool?.sessionID, input as FocusTodoInput | LegacyFocusTodoInput) }),
         })
       })
     } catch (error) {
@@ -1146,10 +1079,12 @@ export default {
           } catch (error) {
             log?.warn("[focus-todo] agent registry unavailable, nudges apply to every agent", { error: String(error) })
           }
-          reminderHookRegistered = true
           await register.call(context.session, "context", async (payload) => {
             await injectTail(todo, payload, settings, subagents)
           })
+          // Mark only after the host confirms registration. A transient hook failure
+          // must not make a later plugin setup permanently inert.
+          reminderHookRegistered = true
         }
       }
     } catch (error) {

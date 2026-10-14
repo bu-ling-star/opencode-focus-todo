@@ -31,6 +31,7 @@ import focusTodoPlugin, {
   TOOL_NAME,
   type FocusTodo,
   type FocusTodoInput,
+  type LegacyFocusTodoInput,
   type Storage,
   type TodoState,
   MAX_DONE,
@@ -70,12 +71,13 @@ async function list(run: ReturnType<typeof createFocusTodo>["run"], sessionID = 
  * → `{location, data}`), probed shape: entries `{id, mode: "primary"|"subagent"}`.
  */
 function fakeContext(
-  options: { failGet?: boolean; failTransform?: boolean; failHook?: boolean; agents?: unknown[]; failAgents?: boolean } = {},
+  options: { failGet?: boolean; failTransform?: boolean; failHook?: boolean; failHookOnce?: boolean; agents?: unknown[]; failAgents?: boolean } = {},
 ) {
   const touched: string[] = []
   const added: Array<{ name: string; description: string; input: unknown; output: unknown; options: unknown }> = []
   const hooks: Array<{ name: string; callback: (payload: unknown) => Promise<void> | void }> = []
   const data = new Map<string, unknown>()
+  let hookAttempts = 0
 
   const storage: Storage = {
     async get(key) {
@@ -107,7 +109,8 @@ function fakeContext(
     },
     session: {
       async hook(name: string, callback: (payload: unknown) => Promise<void> | void) {
-        if (options.failHook) throw new Error("session domain unavailable")
+        hookAttempts += 1
+        if (options.failHook || (options.failHookOnce && hookAttempts === 1)) throw new Error("session domain unavailable")
         hooks.push({ name, callback })
       },
     },
@@ -387,7 +390,7 @@ describe("applyAction", () => {
   test("unknown ids are rejected for update and remove", () => {
     for (const action of ["update", "remove"] as const) {
       const input = action === "update" ? { action, id: "t9", done: true as const } : { action, id: "t9" }
-      expect(applyAction(emptyState(), input as FocusTodoInput)).toEqual({
+      expect(applyAction(emptyState(), input as FocusTodoInput | LegacyFocusTodoInput)).toEqual({
         ok: false,
         error: "unknown id t9; nothing is open",
       })
@@ -445,7 +448,7 @@ describe("applyAction", () => {
   test("unknown actions are rejected", () => {
     expect(applyAction(emptyState(), { action: "purge" } as never)).toEqual({
       ok: false,
-      error: "unknown action (use list|replace|add|update|remove|batch)",
+      error: "unknown action (use list|replace|mutate)",
     })
   })
 
@@ -476,6 +479,38 @@ describe("applyAction", () => {
     expect(outcome.write).toBe(true)
     expect(outcome.state.completed).toBe(1)
     expect(outcome.state.nextId).toBe(4)
+  })
+
+  test("mutate is the canonical atomic edit envelope", () => {
+    const outcome = applyAction(emptyState(), {
+      action: "mutate",
+      ops: [
+        { action: "add", text: "implement storage", status: "in_progress" },
+        { action: "add", text: "write tests" },
+        { action: "update", id: "t2", done: true },
+      ],
+    })
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    expect(outcome.text).toBe("1 active, done=1\nt1:> implement storage\nt2:x write tests")
+  })
+
+  test("mutate does not mix plan replacement into local ops", () => {
+    const outcome = applyAction(emptyState(), {
+      action: "mutate",
+      ops: [{ action: "replace", items: [] } as never],
+    })
+    expect(outcome).toEqual({ ok: false, error: "mutate rejected, 1 of 1 ops failed: op 1: replace must be a top-level action" })
+  })
+
+  test("legacy complete and clear actions still map to canonical updates", () => {
+    const added = applyAction(emptyState(), { action: "add", text: "x" })
+    if (!added.ok) throw new Error("setup failed")
+    const completed = applyAction(added.state, { action: "complete", id: "t1" })
+    expect(completed.ok && completed.state.completed).toBe(1)
+    if (!completed.ok) return
+    const cleared = applyAction(completed.state, { action: "clear" })
+    expect(cleared.ok && cleared.state.items).toEqual([])
   })
 
   test("batch is atomic: one bad op rejects the whole batch", () => {
@@ -788,7 +823,7 @@ describe("plugin entrypoint", () => {
     env["XDG_CONFIG_HOME"] = "C:\\focus-todo-tests-no-config"
     // The two pins below then only spell out the intended shipped defaults.
     env["FOCUS_TODO_REMINDER"] = "1"
-    env["FOCUS_TODO_STALE_AFTER"] = "30"
+    env["FOCUS_TODO_STALE_AFTER"] = "0"
   })
 
   test("the description stays small and keeps every rule it carries", () => {
@@ -804,10 +839,13 @@ describe("plugin entrypoint", () => {
     expect(TOOL_DESCRIPTION).toContain("restart")
     expect(TOOL_DESCRIPTION).toContain('action="replace"') // record multi-step plans
     expect(TOOL_DESCRIPTION).toContain("trivial") // and skip the list for trivial ones
-    expect(TOOL_DESCRIPTION).toContain("few words") // item brevity
+    expect(TOOL_DESCRIPTION).toContain("short") // item brevity
     expect(TOOL_DESCRIPTION).toContain("in_progress")
-    expect(TOOL_DESCRIPTION).toContain('action="batch"') // one call, not repeated edits
-    expect(TOOL_DESCRIPTION).toContain("not tracked") // the authority line
+    expect(TOOL_DESCRIPTION).toContain('action="mutate"') // one call, not repeated edits
+    expect(TOOL_DESCRIPTION).toContain("3+ steps")
+    expect(TOOL_DESCRIPTION).toContain("before work")
+    expect(TOOL_DESCRIPTION).toContain("after verification")
+    expect(TOOL_DESCRIPTION).toContain("partial, blocked, or failing")
   })
 
   test("the schemas stay small too: they are the other half of the cached prefix", () => {
@@ -818,6 +856,12 @@ describe("plugin entrypoint", () => {
     // paid once inside the cache, repaid by two fewer actions for the model to pick.
     expect(JSON.stringify(INPUT_SCHEMA).length).toBeLessThanOrEqual(2200)
     expect(JSON.stringify(OUTPUT_SCHEMA)).toBe('{"type":"string"}')
+  })
+
+  test("the public schema exposes only the three canonical actions", () => {
+    expect(INPUT_SCHEMA.properties.action.enum).toEqual(["list", "replace", "mutate"])
+    expect(INPUT_SCHEMA.properties.ops.items.properties.action.enum).toEqual(["add", "update", "remove"])
+    expect("items" in INPUT_SCHEMA.properties.ops.items.properties).toBe(false)
   })
 
   test("registers exactly one tool named focus_todo with a fixed definition", async () => {
@@ -851,6 +895,7 @@ describe("plugin entrypoint", () => {
   })
 
   test("the hook reads the host's agent registry and never nudges a subagent session", async () => {
+    env["FOCUS_TODO_STALE_AFTER"] = "2"
     const { context, hooks } = fakeContext({
       agents: [
         { id: "build", mode: "primary" },
@@ -876,6 +921,7 @@ describe("plugin entrypoint", () => {
   })
 
   test("a failing agent registry costs the nudge filter, not the reminder", async () => {
+    env["FOCUS_TODO_STALE_AFTER"] = "2"
     const { context, hooks } = fakeContext({ agents: [], failAgents: true })
     await focusTodoPlugin.setup(context as never)
     expect(hooks.length).toBe(1)
@@ -905,15 +951,12 @@ describe("plugin entrypoint", () => {
     expect(appended.content[0]!.text).toContain("[focus_todo] 1 open")
   })
 
-  test("the hook adds one message at most, and only the invitation for a fresh session", async () => {
+  test("the default hook does not invite an empty session to create a list", async () => {
     const { context, hooks } = fakeContext()
     await focusTodoPlugin.setup(context as never)
     const payload = { sessionID: SESSION, messages: [{ id: "m1", role: "user", content: "hi", metadata: {} }] }
     await hooks[0]!.callback(payload)
-    // Nothing is open, so there is no state to report — but a session this process
-    // has never seen gets the one-line invitation to record a plan.
-    expect(payload.messages.length).toBe(2)
-    expect(JSON.stringify(payload.messages[1])).toContain("no list yet")
+    expect(payload.messages.length).toBe(1)
   })
 
   test("the hook never mutates anything but the message array it is handed", async () => {
@@ -940,6 +983,14 @@ describe("plugin entrypoint", () => {
     const { context, added } = fakeContext({ failHook: true })
     await expect(focusTodoPlugin.setup(context as never)).resolves.toBeUndefined()
     expect(added.length).toBe(1)
+  })
+
+  test("a failed hook registration does not permanently lock out a later setup", async () => {
+    const { context, hooks } = fakeContext({ failHookOnce: true })
+    await focusTodoPlugin.setup(context as never)
+    expect(hooks.length).toBe(0)
+    await focusTodoPlugin.setup(context as never)
+    expect(hooks.length).toBe(1)
   })
 
   test("FOCUS_TODO_REMINDER=0 registers no hook at all, and keeps the tool", async () => {
@@ -1011,7 +1062,7 @@ describe("plugin entrypoint", () => {
 })
 
 describe("cache prefix stability", () => {
-  const mutate: FocusTodoInput[] = [
+  const mutate: Array<FocusTodoInput | LegacyFocusTodoInput> = [
     { action: "add", text: "implement storage" },
     { action: "update", id: "t1", text: "implement storage safely" },
     { action: "update", id: "t1", status: "in_progress" },
@@ -1215,37 +1266,66 @@ describe("injectTail", () => {
     expect(typeof (payload.messages[1] as Record<string, unknown>)["content"]).toBe("string")
   })
 
-  test("does not append a second reminder when one is already last", async () => {
+  test("does not append a second reminder when the plugin tail is already last", async () => {
     const { todo } = core()
     await todo.run(SESSION, { action: "add", text: "wire up storage" })
-    const payload = request([user("m1", "hello"), user("m2", "[focus_todo] 1 open: t1- wire up storage")])
+    const payload = request([
+      user("m1", "hello"),
+      { id: "focus-todo-fixed", role: "user", content: [{ type: "text", text: "[focus_todo] 1 open: t1- wire up storage" }] },
+    ])
     expect(await injectTail(todo, payload)).toBe(false)
     expect(payload.messages.length).toBe(2)
   })
 
-  test("stays quiet when the newest message already shows the same state", async () => {
+  test("does not let ordinary user text containing the marker suppress a reminder", async () => {
     const { todo } = core()
     await todo.run(SESSION, { action: "add", text: "wire up storage" })
-    // The host nests a tool result's text inside its own part shape, so the
-    // check has to walk the whole value rather than read a `text` field.
-    const fresh = request([
+    const payload = request([user("m1", "please discuss [focus_todo] 1 open: t1- wire up storage")])
+    expect(await injectTail(todo, payload)).toBe(true)
+    expect(payload.messages.length).toBe(2)
+  })
+
+  test("stays quiet after any assistant/tool tail without inspecting result text", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "wire up storage" })
+    let reads = 0
+    const noRead: FocusTodo = {
+      ...todo,
+      peek: async (sessionID) => {
+        reads += 1
+        return todo.peek(sessionID)
+      },
+    }
+    const afterTool = request([
       user("m1", "hello"),
       {
         id: "m2",
         role: "tool",
-        content: [
-          { type: "tool-result", toolCallId: "c1", output: { output: "1 active, done=0\nt1:- wire up storage" } },
-        ],
+        content: "1 active, done=0\nt1:- wire up storage",
       },
     ])
-    expect(await injectTail(todo, fresh)).toBe(false)
+    expect(await injectTail(noRead, afterTool)).toBe(false)
+    expect(reads).toBe(0)
 
-    // A tool result for a different state does not silence the reminder.
+    // A changed list is reflected at the next user turn, not inferred from tool text.
     await todo.run(SESSION, { action: "add", text: "add tests" })
-    expect(await injectTail(todo, fresh)).toBe(true)
+    const next = request([user("m3", "continue")])
+    expect(await injectTail(todo, next)).toBe(true)
+    expect(JSON.stringify(next.messages.at(-1))).toContain("2 open")
   })
 
-  test("a batch result reads exactly like any other tool result", async () => {
+  test("deduplicates repeated hook calls for the same user message id", async () => {
+    const { todo } = core()
+    await todo.run(SESSION, { action: "add", text: "wire up storage" })
+    const first = request([user("turn-1", "continue")])
+    expect(await injectTail(todo, first)).toBe(true)
+
+    const retry = request([user("turn-1", "continue")])
+    expect(await injectTail(todo, retry)).toBe(false)
+    expect(retry.messages).toHaveLength(1)
+  })
+
+  test("a mutate result is returned as the complete final state", async () => {
     const { todo } = core()
     const result = await todo.run(SESSION, {
       action: "batch",
@@ -1298,13 +1378,11 @@ describe("injectTail", () => {
     const invalid = request([user("m1", "hi")], "../escape")
     expect(await injectTail(todo, invalid)).toBe(false)
 
-    // A different but valid session sees its own (empty) list, so it gets the
-    // "no list yet" invitation rather than the other session's items.
+    // A different but valid empty session stays quiet with the default reminder
+    // policy; it does not get an invitation to create bookkeeping.
     const other = request([user("m1", "hi")], "ses_other")
-    expect(await injectTail(todo, other)).toBe(true)
-    const text = JSON.stringify((other.messages[1] as Record<string, unknown>)["content"])
-    expect(text).toContain("no list yet")
-    expect(text).not.toContain("elsewhere")
+    expect(await injectTail(todo, other)).toBe(false)
+    expect(other.messages).toHaveLength(1)
   })
 
   test("shrugs at malformed payloads instead of throwing into the request path", async () => {
@@ -1389,7 +1467,7 @@ describe("nudges: inviting the model to use the list", () => {
     expect(lastText(first)).toContain("no list yet")
     // An offer, not an order: it says the tool is available, and never tells the
     // model to call anything.
-    expect(lastText(first)).toContain("is available")
+    expect(lastText(first)).toBe('[{"type":"text","text":"[focus_todo] no list yet"}]')
     expect(lastText(first)).not.toContain("replace")
 
     // Same session, next turn: one request of quiet is nowhere near the threshold.
@@ -1427,7 +1505,7 @@ describe("nudges: inviting the model to use the list", () => {
     const resumed = request([turn("m1")])
     expect(await injectTail(todo, resumed, settings)).toBe(true)
     expect(lastText(resumed)).toContain("1 open")
-    expect(lastText(resumed)).toContain("update it if it changed")
+    expect(lastText(resumed)).toContain("update if changed")
 
     // Firing reset the counter, so the very next turn is informative only.
     const quiet = request([turn("m1"), turn("m2")])
@@ -1440,7 +1518,7 @@ describe("nudges: inviting the model to use the list", () => {
     await injectTail(todo, request([toolResult("b")]), settings)
     const stale = request([turn("m2"), turn("m3")])
     expect(await injectTail(todo, stale, settings)).toBe(true)
-    expect(lastText(stale)).toContain("update it if it changed")
+    expect(lastText(stale)).toContain("update if changed")
   })
 
   test("using the tool resets the cadence, so a working session is never nudged", async () => {
@@ -1480,8 +1558,8 @@ describe("nudges: inviting the model to use the list", () => {
     await todo.run(SESSION, { action: "add", text: "implement storage" })
     for (let i = 0; i < 6; i += 1) {
       const payload = request([toolResult(`step ${i}`)])
-      expect(await injectTail(todo, payload, settings)).toBe(true) // the state line itself
-      expect(lastText(payload)).not.toContain("update it")
+      expect(await injectTail(todo, payload, settings)).toBe(false)
+      expect(payload.messages).toHaveLength(1)
     }
   })
 
@@ -1500,7 +1578,7 @@ describe("nudges: inviting the model to use the list", () => {
 
     // With a list, the state line still lands — informative only.
     await todo.run(SESSION, { action: "add", text: "implement storage" })
-    const state = asAgent(request([turn("m1")]), "general")
+    const state = asAgent(request([turn("m2")]), "general")
     expect(await injectTail(todo, state, settings, subs)).toBe(true)
     expect(lastText(state)).toContain("1 open")
     expect(lastText(state)).not.toContain("update it")
@@ -1508,14 +1586,14 @@ describe("nudges: inviting the model to use the list", () => {
     // Even a stale turn start cannot fire the clause inside a subagent.
     await injectTail(todo, request([toolResult("a")]), settings, subs)
     await injectTail(todo, request([toolResult("b")]), settings, subs)
-    const stale = asAgent(request([turn("m2")]), "explore")
+    const stale = asAgent(request([turn("m3")]), "explore")
     expect(await injectTail(todo, stale, settings, subs)).toBe(true)
     expect(lastText(stale)).not.toContain("update it")
 
     // A primary agent on the same cadence: the clause is back.
-    const primary = asAgent(request([turn("m3")]), "build")
+    const primary = asAgent(request([turn("m4")]), "build")
     expect(await injectTail(todo, primary, settings, subs)).toBe(true)
-    expect(lastText(primary)).toContain("update it if it changed")
+    expect(lastText(primary)).toContain("update if changed")
 
     // No set handed in (an older caller): behaviour is exactly as before.
     const legacy = request([turn("m1")], "ses_legacyagent000000000")
@@ -1548,7 +1626,7 @@ describe("nudges: inviting the model to use the list", () => {
     const tight = { ...DEFAULT_SETTINGS, reminderBudget: 120, staleAfter: 0 }
     const payload = request([turn("m1")])
     expect(await injectTail(todo, payload, { ...tight, staleAfter: 1 })).toBe(true)
-    expect(lastText(payload)).toContain("update it if it changed")
+    expect(lastText(payload)).toContain("update if changed")
     // The whole appended message — state line plus clause — honours the budget.
     expect(JSON.parse(lastText(payload))[0].text.length).toBeLessThanOrEqual(120)
   })
@@ -1573,7 +1651,7 @@ describe("nudges: inviting the model to use the list", () => {
 
     const empty = core()
     const invite = request([turn("m1")], "ses_custominvite00000000000")
-    await injectTail(empty.todo, invite, { ...DEFAULT_SETTINGS, creationNudge: "记一下计划" })
+    await injectTail(empty.todo, invite, { ...DEFAULT_SETTINGS, creationNudge: "记一下计划", staleAfter: 1 })
     expect(lastText(invite)).toContain("记一下计划")
   })
 
@@ -1608,9 +1686,9 @@ describe("settings", () => {
     expect(resolveSettings(undefined, {})).toEqual(DEFAULT_SETTINGS)
     expect(DEFAULT_SETTINGS.reminder).toBe(true)
     expect(DEFAULT_SETTINGS.reminderBudget).toBe(360)
-    expect(DEFAULT_SETTINGS.staleAfter).toBe(10)
+    expect(DEFAULT_SETTINGS.staleAfter).toBe(0)
     expect(DEFAULT_SETTINGS.itemChars).toBe(48)
-    expect(DEFAULT_SETTINGS.maintenanceNudge).toContain("update it")
+    expect(DEFAULT_SETTINGS.maintenanceNudge).toContain("update")
     expect(DEFAULT_SETTINGS.creationNudge).toContain("no list yet")
     // The invitation offers the tool; it does not order a call.
     expect(DEFAULT_SETTINGS.creationNudge).not.toContain("replace")
@@ -1640,7 +1718,7 @@ describe("settings", () => {
     expect(resolveSettings({ staleAfter: -3 }, {}).staleAfter).toBe(0)
     expect(resolveSettings({ staleAfter: 9999 }, {}).staleAfter).toBe(200)
     expect(resolveSettings({ staleAfter: "3" }, {}).staleAfter).toBe(3)
-    expect(resolveSettings({ staleAfter: "soon" }, {}).staleAfter).toBe(10)
+    expect(resolveSettings({ staleAfter: "soon" }, {}).staleAfter).toBe(0)
   })
 
   test("clamps the item clip, and the retired invitation cap is inert", () => {

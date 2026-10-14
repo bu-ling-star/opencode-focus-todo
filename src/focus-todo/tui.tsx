@@ -23,7 +23,7 @@
  * server half owns state.
  */
 import { For, Show, createMemo, createSignal } from "solid-js"
-import { MAX_ROW_WIDTH, buildPanel, clip, isFoldStorePair, latestFocusState, reminderStatus, toHex } from "./view.ts"
+import { MAX_ROW_WIDTH, buildPanel, clip, isFoldStorePair, latestFocusState, toHex } from "./view.ts"
 import type { PanelRow, ViewStatus } from "./view.ts"
 
 /**
@@ -170,14 +170,14 @@ function FocusTodoPanel(props: { readonly context: TuiContext; readonly input: T
       if (typeof sessionID !== "string" || sessionID.length === 0) {
         // No session yet: the panel stays visible as the same empty state it
         // shows before the first focus_todo call, rather than flickering away.
-        return buildPanel(undefined, width(), "")
+        return buildPanel(undefined, width())
       }
       const messages = props.context.data?.session?.message?.list(sessionID) ?? []
       const view = latestFocusState(messages)
-      return buildPanel(view, width(), reminderStatus(messages, view))
+      return buildPanel(view, width())
     } catch {
       // A failed read must never take the sidebar down with it.
-      return buildPanel(undefined, width(), "")
+      return buildPanel(undefined, width())
     }
   })
 
@@ -191,11 +191,6 @@ function FocusTodoPanel(props: { readonly context: TuiContext; readonly input: T
         {`${fold.open() ? "▼" : "▶"} ${clip(panel()?.header ?? "", Math.max(1, width() - 2))}`}
       </text>
       <Show when={fold.open()}>
-        <Show when={panel()?.status}>
-          <text fg={toHex(props.context.theme?.text?.muted)} truncate>
-            {panel()?.status}
-          </text>
-        </Show>
         <For each={panel()?.rows ?? []}>
           {(row: PanelRow) => (
             <text fg={statusColor(props.context.theme?.text, row.status)} truncate>
