@@ -25,12 +25,12 @@ export const TOOL_NAME = "focus_todo"
 /** Must match `MAX_ITEMS` in `server.ts` — a test asserts it, so the two cannot drift. */
 export const MAX_OPEN_ROWS = 16
 /** Must match `MAX_DONE` in `server.ts` — a test asserts it. */
-export const MAX_DONE_ROWS = 16
+export const MAX_DONE_ROWS = 10
 /** The longest list the tool can ever produce: open rows plus marked ones. */
 export const MAX_ROWS = MAX_OPEN_ROWS + MAX_DONE_ROWS
 
 /** Never emit a row wider than this many terminal columns. */
-export const MAX_ROW_WIDTH = 60
+export const MAX_ROW_WIDTH = 96
 
 /** How far back to look for the newest tool result; bounds the per-render cost. */
 export const MESSAGE_SCAN_LIMIT = 60

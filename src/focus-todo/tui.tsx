@@ -135,7 +135,8 @@ function createFold(context: TuiContext): Fold {
 /**
  * The sidebar pane is about a third of the terminal, and the host hides it
  * entirely on narrow terminals, so a share of the terminal width is a safe
- * budget. Rows are clipped to it and never wrap into extra lines.
+ * budget. Rows are clipped to it; the host may still wrap when the actual slot
+ * is narrower than the renderer's reported terminal width.
  */
 function rowWidth(terminalWidth: unknown): number {
   if (typeof terminalWidth !== "number" || !Number.isFinite(terminalWidth) || terminalWidth <= 0) {

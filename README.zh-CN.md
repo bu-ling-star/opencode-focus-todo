@@ -90,7 +90,7 @@ rm -r ~/.config/opencode/plugin/focus-todo
 只移除行，不改变计数。旧的 `add`、`update`、`remove`、`batch`、`complete`、`clear`
 输入仍在运行时兼容，但不会出现在公开 schema 中。
 
-工具强制执行：最多 16 条开放项、最多保留 16 条完成行、每项最多 150 字符、最多一条
+工具强制执行：最多 16 条开放项、最多保留 10 条完成行、每项最多 150 字符、最多一条
 开放项为 `in_progress`；空文本、非法状态、重复 id、未知 id 会明确报错；`mutate` 任一
 操作失败时整批不写入。
 

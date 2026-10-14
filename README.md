@@ -99,7 +99,7 @@ compatibility, but are intentionally absent from the public schema.
 
 Rules enforced by the tool:
 
-* at most 16 open items and 16 retained done rows;
+* at most 16 open items and 10 retained done rows;
 * at most 150 characters per item;
 * at most one open item `in_progress`;
 * ids are short, stable and never reused within a session;

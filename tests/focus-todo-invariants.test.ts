@@ -29,6 +29,7 @@ import { describe, expect, test } from "bun:test"
 import {
   applyAction,
   DEFAULT_SETTINGS,
+  DONE_TEXT_MAX,
   emptyState,
   formatReminder,
   formatState,
@@ -149,7 +150,9 @@ function assertInvariants(state: TodoState, context: string): void {
   // Marked rows are clipped in the tool result (open ones keep their full text), so the
   // panel sees a shortened row for them — by design, and the only place text is lost.
   const shownText = (item: TodoItem): string =>
-    item.done === true && item.text.length > 24 ? `${item.text.slice(0, 23)}\u2026` : item.text
+    item.done === true && item.text.length > DONE_TEXT_MAX
+      ? `${item.text.slice(0, DONE_TEXT_MAX - 1)}\u2026`
+      : item.text
   const expectedRows = [...open, ...marked].map(
     (item) => `${item.id}:${item.done === true ? "done" : item.status}:${shownText(item)}`,
   )
@@ -236,12 +239,16 @@ describe("state invariants under random workloads", () => {
     assertInvariants(state, "3000-step run")
     expect(state.items.length).toBeLessThanOrEqual(MAX_ITEMS + MAX_DONE)
     // The state that gets persisted stays small, whatever happened along the way.
-    expect(formatState(state).length).toBeLessThan(MAX_ITEMS * MAX_TEXT + MAX_DONE * 32 + 32)
+    const openRowOverhead = 32
+    const doneRowOverhead = 32
+    expect(formatState(state).length).toBeLessThan(
+      MAX_ITEMS * (MAX_TEXT + openRowOverhead) + MAX_DONE * (DONE_TEXT_MAX + doneRowOverhead) + 64,
+    )
   })
 })
 
 describe("round-trips the panel depends on", () => {
-  test("a full 16 open + 16 marked list survives format → parse → render unchanged", () => {
+  test("a full capped open + marked list survives format → parse → render unchanged", () => {
     const items: TodoItem[] = []
     for (let index = 1; index <= MAX_ITEMS + MAX_DONE; index += 1) {
       items.push({
@@ -255,7 +262,7 @@ describe("round-trips the panel depends on", () => {
     assertInvariants(state, "full list")
   })
 
-  test("a marked row whose text was clipped to 24 characters still parses", () => {
+  test("a marked row whose text was clipped to the display cap still parses", () => {
     const state: TodoState = {
       version: 1,
       revision: 1,
@@ -266,7 +273,7 @@ describe("round-trips the panel depends on", () => {
     const parsed = parseFocusState(formatState(state))
     expect(parsed?.done).toBe(1)
     expect(parsed?.items[0]?.status).toBe("done")
-    expect(parsed?.items[0]?.text.length).toBe(24) // 23 characters plus the ellipsis
+    expect(parsed?.items[0]?.text.length).toBe(DONE_TEXT_MAX) // cap minus one character plus the ellipsis
     expect(parsed?.items[0]?.text.endsWith("\u2026")).toBe(true)
   })
 })

@@ -1622,7 +1622,7 @@ describe("nudges: inviting the model to use the list", () => {
 
   test("the clause is inside the budget, not bolted on top of it", async () => {
     const { todo } = core()
-    await todo.run(SESSION, { action: "add", text: "implement " + "z".repeat(100) })
+    await todo.run(SESSION, { action: "add", text: "implement " + "z".repeat(MAX_TEXT - "implement ".length) })
     const tight = { ...DEFAULT_SETTINGS, reminderBudget: 120, staleAfter: 0 }
     const payload = request([turn("m1")])
     expect(await injectTail(todo, payload, { ...tight, staleAfter: 1 })).toBe(true)
@@ -1663,7 +1663,7 @@ describe("nudges: inviting the model to use the list", () => {
     const long = 300
     const clause = ` — ${"c".repeat(long - 4)}`
     const { todo } = core()
-    await todo.run(SESSION, { action: "replace", items: [{ text: "x".repeat(150) }, { text: "y" }] })
+    await todo.run(SESSION, { action: "replace", items: [{ text: "x".repeat(MAX_TEXT) }, { text: "y" }] })
     const payload = request([turn("m1")])
     await injectTail(todo, payload, { ...DEFAULT_SETTINGS, maintenanceNudge: clause, staleAfter: 1 })
 

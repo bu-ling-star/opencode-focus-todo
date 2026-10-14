@@ -89,12 +89,12 @@ export type ActionOutcome = ActionResult | ActionFailure
 export const TOOL_NAME = "focus_todo"
 export const MAX_ITEMS = 16
 /** Marked items kept per session; the oldest ones are dropped once this is exceeded. */
-export const MAX_DONE = 16
+export const MAX_DONE = 10
 export const MAX_TEXT = 150
 /** Upper bound on one mutation envelope: a plan holds at most 16 open items, so 24 ops covers any realistic reshuffle. */
 export const MAX_BATCH_OPS = 24
-/** Done rows appear in every tool result, so their text is clipped harder than an open item. */
-export const DONE_TEXT_MAX = 24
+/** Done rows appear in every tool result, so keep them compact while retaining a useful label. */
+export const DONE_TEXT_MAX = 48
 export const KEY_PREFIX = "focus-todo/session/"
 
 /**
