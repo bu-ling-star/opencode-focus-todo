@@ -23,7 +23,7 @@
  * server half owns state.
  */
 import { For, Show, createMemo, createSignal } from "solid-js"
-import { MAX_ROW_WIDTH, buildPanel, clip, isFoldStorePair, latestFocusState, reminderStatus } from "./view.ts"
+import { MAX_ROW_WIDTH, buildPanel, clip, isFoldStorePair, latestFocusState, reminderStatus, toHex } from "./view.ts"
 import type { PanelRow, ViewStatus } from "./view.ts"
 
 /**
@@ -33,18 +33,24 @@ import type { PanelRow, ViewStatus } from "./view.ts"
  * (see IMPLEMENTATION_NOTES.md §6).
  */
 /**
- * The host hands `theme.current` as a *flat* colour-keyed palette — verified
- * against the shipped opencode-visual-cache V2 panel (`ctx.theme.current`
- * feeding `fg`), not the nested `theme.text.*` tree the plugin types suggest.
+ * The host hands `setup` a nested colour tree whose leaves are opentui colour
+ * objects (`{ buffer: Uint8Array [r, g, b, a] }`) — verified by a runtime probe
+ * of the real setup context. The flat `theme.current` palette that the shipped
+ * opencode-visual-cache reads belongs to the *slot-callback* context, which this
+ * plugin never receives: the render function gets exactly one argument (the
+ * panel input), so colours must come from the setup tree, converted to hex.
  */
-interface TuiTheme {
-  readonly text?: string
-  readonly textMuted?: string
-  readonly success?: string
-  readonly warning?: string
-  readonly error?: string
-  readonly primary?: string
-  readonly border?: string
+interface TuiColor {
+  readonly buffer?: unknown
+}
+
+interface TuiTextTheme {
+  readonly base?: TuiColor | string
+  readonly muted?: TuiColor | string
+  readonly feedback?: {
+    readonly success?: { readonly base?: TuiColor | string }
+    readonly error?: { readonly base?: TuiColor | string }
+  }
 }
 
 interface TuiPanelInput {
@@ -53,7 +59,7 @@ interface TuiPanelInput {
 
 interface TuiContext {
   readonly renderer?: { readonly terminalWidth?: number }
-  readonly theme?: { readonly current?: TuiTheme }
+  readonly theme?: { readonly text?: TuiTextTheme }
   readonly data?: {
     readonly session?: {
       readonly message?: { list(sessionID: string): readonly unknown[] }
@@ -138,26 +144,19 @@ function rowWidth(terminalWidth: unknown): number {
   return Math.max(MIN_ROW_WIDTH, Math.min(MAX_ROW_WIDTH, Math.floor(terminalWidth / 3) - 2))
 }
 
-function pick(...values: readonly (string | undefined)[]): string | undefined {
-  for (const value of values) {
-    if (typeof value === "string" && value.length > 0) return value
-  }
-  return undefined
-}
-
-function statusColor(theme: TuiTheme | undefined, status: ViewStatus): string | undefined {
+function statusColor(theme: TuiTextTheme | undefined, status: ViewStatus): string | undefined {
   if (status === "done") {
     // Marked rows stay visible but recede: the open work is what deserves attention.
-    return pick(theme?.textMuted)
+    return toHex(theme?.muted)
   }
   if (status === "in_progress") {
-    return pick(theme?.success, theme?.text)
+    return toHex(theme?.feedback?.success?.base)
   }
   if (status === "blocked") {
-    return pick(theme?.error, theme?.textMuted)
+    return toHex(theme?.feedback?.error?.base)
   }
   // Pending rows are the actionable backlog: plain text colour, brighter than done.
-  return pick(theme?.text)
+  return toHex(theme?.base)
 }
 
 function FocusTodoPanel(props: { readonly context: TuiContext; readonly input: TuiPanelInput }) {
@@ -185,7 +184,7 @@ function FocusTodoPanel(props: { readonly context: TuiContext; readonly input: T
   return (
     <box flexDirection="column">
       <text
-        fg={pick(props.context.theme?.current?.text)}
+        fg={toHex(props.context.theme?.text?.base)}
         truncate
         onMouseUp={() => fold.toggle()}
       >
@@ -193,13 +192,13 @@ function FocusTodoPanel(props: { readonly context: TuiContext; readonly input: T
       </text>
       <Show when={fold.open()}>
         <Show when={panel()?.status}>
-          <text fg={pick(props.context.theme?.current?.textMuted)} truncate>
+          <text fg={toHex(props.context.theme?.text?.muted)} truncate>
             {panel()?.status}
           </text>
         </Show>
         <For each={panel()?.rows ?? []}>
           {(row: PanelRow) => (
-            <text fg={statusColor(props.context.theme?.current, row.status)} truncate>
+            <text fg={statusColor(props.context.theme?.text, row.status)} truncate>
               {row.line}
             </text>
           )}
@@ -212,8 +211,6 @@ function FocusTodoPanel(props: { readonly context: TuiContext; readonly input: T
 const mod = {
   id: "focus-todo",
   setup(context: TuiContext): (() => void) | undefined {
-    // If this module is ever handed a context without the TUI surface, stay inert
-    // instead of throwing into the host's plugin loader.
     if (typeof context?.ui?.slot !== "function") return undefined
     if (typeof context.data?.session?.message?.list !== "function") return undefined
 

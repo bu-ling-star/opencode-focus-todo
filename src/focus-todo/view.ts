@@ -197,6 +197,35 @@ export function clip(text: string, width: number): string {
 }
 
 /**
+ * Normalise a host theme leaf into a `#rrggbb` string. The host ships opentui
+ * colour objects (`{ buffer: Uint8Array [r, g, b, a] }`), and the panel's `fg`
+ * prop accepts hex strings; a plain `#hex` leaf passes straight through, and a
+ * `{ r, g, b }` triple is accepted for future hosts. The buffer is duck-typed
+ * rather than `instanceof`-checked so a cross-realm typed array still parses.
+ * Anything else returns undefined and the caller falls back to the default colour.
+ */
+export function toHex(raw: unknown): string | undefined {
+  if (typeof raw === "string" && raw.length > 0) return raw
+  if (raw === null || typeof raw !== "object") return undefined
+  const view = (raw as { buffer?: unknown }).buffer
+  if (view !== null && typeof view === "object") {
+    const octets = view as { readonly length?: number }
+    const first = (view as readonly unknown[])[0]
+    if (typeof octets.length === "number" && octets.length >= 3 && typeof first === "number") {
+      const [r, g, b] = view as readonly number[]
+      return `#${[r, g, b].map((value) => (value as number).toString(16).padStart(2, "0")).join("")}`
+    }
+  }
+  const rgb = raw as { r?: unknown; g?: unknown; b?: unknown }
+  if (typeof rgb.r === "number" && typeof rgb.g === "number" && typeof rgb.b === "number") {
+    // Any channel above 1 marks the triple as 0..255; otherwise treat it as 0..1 floats.
+    const scale = rgb.r > 1 || rgb.g > 1 || rgb.b > 1 ? 1 : 255
+    return `#${[rgb.r, rgb.g, rgb.b].map((value) => Math.max(0, Math.min(255, Math.round((value as number) * scale))).toString(16).padStart(2, "0")).join("")}`
+  }
+  return undefined
+}
+
+/**
  * Whether the newest message in the window already is a `focus_todo` result — the
  * exact case the server's dedup guard silences, so the reminder is not appended.
  */

@@ -342,9 +342,11 @@ the server half's nudge counters are not visible to the TUI half (they live in s
 storage domains), so richer wording like "reminded *and* updated" is deliberately not
 attempted. It reads the newest `focus_todo` tool result already present in the current
 session's message window and renders it. It writes nothing, polls nothing, has no popups and
-no settings, and it does not add a second list. Colours follow the active theme through the
-host's flat `theme.current` palette (in-progress draws the success colour, blocked the error
-colour, a marked row recedes to the muted text colour), and long lines are clipped to the
+no settings, and it does not add a second list. Colours follow the active theme: the setup
+context ships a nested colour tree whose leaves are opentui colour objects
+(`{ buffer: Uint8Array [r, g, b, a] }`), converted to hex before they reach `fg`
+(in-progress draws the success colour, blocked the error colour, a marked row recedes to
+the muted text colour), and long lines are clipped to the
 panel width, counted in display columns so CJK text lines up.
 
 If a future OpenCode changes the internal TUI API, the panel turns inert and the tool keeps
@@ -382,7 +384,7 @@ cp -R src/focus-todo/. ~/.config/opencode/plugin/focus-todo/
 ```
 
 ```bash
-bun test                       # 179 unit tests, incl. a seeded invariant sweep
+bun test                       # 182 unit tests, incl. a seeded invariant sweep
 bunx --bun tsc --noEmit        # strict type check, no node_modules needed
 ```
 

@@ -73,11 +73,10 @@ function toolPart(text: string) {
 
 /** Flat palette behind `theme.current` — the shape the host actually hands over. */
 const THEME = {
-  current: {
-    text: "#base",
-    textMuted: "#muted",
-    success: "#ok",
-    error: "#bad",
+  text: {
+    base: "#base",
+    muted: "#muted",
+    feedback: { success: { base: "#ok" }, error: { base: "#bad" } },
   },
 }
 
@@ -341,11 +340,11 @@ describe("panel rendering", () => {
     // Header, reminder status, then the three rows — done recedes, pending is plain
     // text colour, in-progress is success green, blocked is error red.
     expect(collected).toEqual([
-      THEME.current.text,
-      THEME.current.textMuted,
-      THEME.current.success,
-      THEME.current.text,
-      THEME.current.error,
+      THEME.text.base,
+      THEME.text.muted,
+      THEME.text.feedback.success.base,
+      THEME.text.base,
+      THEME.text.feedback.error.base,
     ])
   })
 })

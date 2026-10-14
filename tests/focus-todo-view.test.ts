@@ -9,7 +9,7 @@
 import { describe, expect, test } from "bun:test"
 
 import { applyAction, emptyState, formatReminder, formatState, MAX_DONE, MAX_ITEMS, type TodoState } from "../src/focus-todo/server.ts"
-import { MAX_DONE_ROWS, MAX_OPEN_ROWS, MAX_ROW_WIDTH, MAX_ROWS, MESSAGE_SCAN_LIMIT, TOOL_NAME, buildPanel, charWidth, clip, displayWidth, extractFocusState, isFoldStorePair, latestFocusState, parseFocusState, type FocusView, reminderStatus, newestIsOwnResult } from "../src/focus-todo/view.ts"
+import { MAX_DONE_ROWS, MAX_OPEN_ROWS, MAX_ROW_WIDTH, MAX_ROWS, MESSAGE_SCAN_LIMIT, TOOL_NAME, buildPanel, charWidth, clip, displayWidth, extractFocusState, isFoldStorePair, latestFocusState, parseFocusState, type FocusView, reminderStatus, newestIsOwnResult, toHex } from "../src/focus-todo/view.ts"
 
 const SESSION = "ses_view0000aaaaaaaaaaaaaaaaaaaaa"
 
@@ -240,6 +240,30 @@ describe("width handling", () => {
         expect(displayWidth(clip(text, width))).toBeLessThanOrEqual(width)
       }
     }
+  })
+})
+
+describe("toHex", () => {
+  test("converts the host's opentui colour objects into hex strings", () => {
+    // The exact shape the runtime probe found: `{ buffer: Uint8Array [r, g, b, a] }`.
+    const alpha = new Uint8Array([127, 217, 98, 255])
+    expect(toHex({ buffer: alpha })).toBe("#7fd962")
+  })
+
+  test("passes hex strings through and handles rgb triples defensively", () => {
+    expect(toHex("#C5C5BB")).toBe("#C5C5BB")
+    expect(toHex({ r: 12, g: 34, b: 56 })).toBe("#0c2238")
+    // A future host might ship 0..1 floats; rounding keeps them sane.
+    expect(toHex({ r: 1, g: 0.5, b: 0 })).toBe("#ff8000")
+  })
+
+  test("returns undefined for anything it cannot read", () => {
+    expect(toHex(undefined)).toBeUndefined()
+    expect(toHex(null)).toBeUndefined()
+    expect(toHex(42)).toBeUndefined()
+    expect(toHex({})).toBeUndefined()
+    expect(toHex({ buffer: "not a view" })).toBeUndefined()
+    expect(toHex({ buffer: new Uint8Array(2) })).toBeUndefined()
   })
 })
 

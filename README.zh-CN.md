@@ -309,7 +309,8 @@ OpenCode 启动
 面板只报告消息窗口能证明的东西，不编造它兜不住的标签：服务半区的催更计数器对 TUI
 半区不可见（两者分属不同存储域），所以"已提醒*且已更新*"这类更丰富的措辞被刻意放弃。
 它读取当前会话消息窗口里已有的最新 `focus_todo` 工具结果并渲染。不写、不轮询、没有
-弹窗和设置，也不添加第二份清单。颜色经宿主扁平的 `theme.current` 调色板跟随当前主题
+弹窗和设置，也不添加第二份清单。颜色跟随当前主题：setup 上下文携带嵌套色彩树，叶子是
+opentui 颜色对象（`{ buffer: Uint8Array [r, g, b, a] }`），送到 `fg` 前转换为 hex
 （进行中用 success 绿、受阻用 error 红、标记行退到弱化文本色），超长行按
 显示列宽裁剪到面板宽度，CJK 文本对齐不乱。
 
@@ -343,7 +344,7 @@ cp -R src/focus-todo/. ~/.config/opencode/plugin/focus-todo/
 ```
 
 ```bash
-bun test                       # 179 个单元测试，含一个带种子的不变量扫描
+bun test                       # 182 个单元测试，含一个带种子的不变量扫描
 bunx --bun tsc --noEmit        # 严格类型检查，不需要 node_modules
 ```
 
