@@ -224,11 +224,11 @@ describe("panel rendering", () => {
     plugin.setup(context)
 
     const tree = claims[0]?.render({ sessionID: SESSION })
-    expect(renderText(tree)).toEqual(["▼ Focus 2 active, done 1", "▶ t1 implement storage", "○ t2 add tests"])
+    expect(renderText(tree)).toEqual(["▼ Focus 2 active, done 1 · 1 running", "▶ t1 implement storage", "○ t2 add tests"])
 
     // A newer user message changes server-side request context, not the facts shown here.
     conversation.push({ role: "user", content: "go on" })
-    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ Focus 2 active, done 1", "▶ t1 implement storage", "○ t2 add tests"])
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ Focus 2 active, done 1 · 1 running", "▶ t1 implement storage", "○ t2 add tests"])
   })
 
   test("renders the count when nothing is open and no rows are left", () => {
@@ -283,7 +283,7 @@ describe("panel rendering", () => {
     })
     plugin.setup(context)
 
-    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ Focus 1 active", "▶ t1 mine"])
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ Focus 1 active · 1 running", "▶ t1 mine"])
     expect(renderText(claims[0]?.render({ sessionID: "ses_other0000bbbbbbbbbbbbbbbbbbbbb" }))).toEqual([
       "▼ Focus 0 active, done 2",
     ])
@@ -298,7 +298,7 @@ describe("panel rendering", () => {
     const { context, claims } = fakeContext({ [SESSION]: conversation })
     plugin.setup(context)
 
-    const expected = ["▼ Focus 2 active", "▶ t1 alpha", "○ t2 beta"]
+    const expected = ["▼ Focus 2 active · 1 running", "▶ t1 alpha", "○ t2 beta"]
     expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(expected)
 
     for (let index = 0; index < 70; index += 1) {
@@ -413,7 +413,7 @@ describe("fold", () => {
     plugin.setup(context)
 
     const lines = renderText(claims[0]?.render({ sessionID: SESSION }))
-    expect(lines[0]).toBe("▼ Focus 1 active")
+    expect(lines[0]).toBe("▼ Focus 1 active · 1 running")
     expect(lines).toContain("▶ t1 mine")
   })
 
@@ -434,7 +434,7 @@ describe("fold", () => {
     expect(foldState.open).toBe(false)
     // ...and a fresh render (a new component instance, e.g. after a session switch)
     // still reads the folded flag from the same shared state object.
-    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▶ Focus 1 active"])
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▶ Focus 1 active · 1 running"])
   })
 
   test("without a host store the fold still works, it merely resets on restart", () => {
@@ -442,7 +442,7 @@ describe("fold", () => {
     plugin.setup(context)
 
     // Expanded on first render, and the toggle is wired without throwing.
-    expect(renderText(claims[0]?.render({ sessionID: SESSION }))[0]).toBe("▼ Focus 1 active")
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))[0]).toBe("▼ Focus 1 active · 1 running")
     const header = findNode(
       claims[0]?.render({ sessionID: SESSION }),
       "text",

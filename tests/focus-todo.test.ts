@@ -971,12 +971,19 @@ describe("plugin entrypoint", () => {
     expect(appended.content[0]!.text).toContain("[focus_todo] 1 open")
   })
 
-  test("the default hook does not invite an empty session to create a list", async () => {
+  test("the default hook invites an empty session to create a list, exactly once", async () => {
     const { context, hooks } = fakeContext()
     await focusTodoPlugin.setup(context as never)
     const payload = { sessionID: SESSION, messages: [{ id: "m1", role: "user", content: "hi", metadata: {} }] }
     await hooks[0]!.callback(payload)
-    expect(payload.messages.length).toBe(1)
+    // `staleAfter: 0` silences the recurring clause, not the one-time invitation:
+    // without it a session that never made a list hears nothing from the plugin.
+    expect(payload.messages.length).toBe(2)
+    expect((payload.messages[1] as { content: string }).content).toContain("no list yet")
+
+    const second = { sessionID: SESSION, messages: [{ id: "m2", role: "user", content: "hi", metadata: {} }] }
+    await hooks[0]!.callback(second)
+    expect(second.messages.length).toBe(1)
   })
 
   test("the hook never mutates anything but the message array it is handed", async () => {
@@ -1380,15 +1387,23 @@ describe("injectTail", () => {
 
     const small = request([user("m1", "hello")])
     expect(await injectTail(todo, small, { ...DEFAULT_SETTINGS, reminderBudget: 80, staleAfter: 0 })).toBe(true)
-    expect(JSON.stringify((small.messages[1] as Record<string, unknown>)["content"]).length).toBeLessThanOrEqual(90)
+    const text = (small.messages[1] as { content: Array<{ text: string }> }).content[0]?.text ?? ""
+    // The whole injected message — shell, state line and all — stays inside the budget.
+    expect(text.length).toBeLessThanOrEqual(80)
+    expect(text).toContain("[focus_todo] 1 open: t1- wire up storage")
   })
 
-  test("appends nothing when the session has nothing open and nudging is off", async () => {
+  test("an empty list gets the invitation once, then silence while nudging is off", async () => {
     const { todo } = core()
     await todo.run(SESSION, { action: "replace", items: [] })
     const payload = request([user("m1", "hi")])
-    expect(await injectTail(todo, payload, { ...DEFAULT_SETTINGS, staleAfter: 0 })).toBe(false)
-    expect(payload.messages.length).toBe(1)
+    expect(await injectTail(todo, payload, { ...DEFAULT_SETTINGS, staleAfter: 0 })).toBe(true)
+    expect(payload.messages.length).toBe(2)
+    expect(JSON.stringify((payload.messages[1] as Record<string, unknown>)["content"])).toContain("no list yet")
+
+    const later = request([user("m2", "hi")])
+    expect(await injectTail(todo, later, { ...DEFAULT_SETTINGS, staleAfter: 0 })).toBe(false)
+    expect(later.messages.length).toBe(1)
   })
 
   test("an invalid session id is left alone; another session has its own state", async () => {
@@ -1398,11 +1413,10 @@ describe("injectTail", () => {
     const invalid = request([user("m1", "hi")], "../escape")
     expect(await injectTail(todo, invalid)).toBe(false)
 
-    // A different but valid empty session stays quiet with the default reminder
-    // policy; it does not get an invitation to create bookkeeping.
+    // A different but valid empty session gets the one-time invitation, and only that.
     const other = request([user("m1", "hi")], "ses_other")
-    expect(await injectTail(todo, other)).toBe(false)
-    expect(other.messages).toHaveLength(1)
+    expect(await injectTail(todo, other)).toBe(true)
+    expect(other.messages).toHaveLength(2)
   })
 
   test("shrugs at malformed payloads instead of throwing into the request path", async () => {
@@ -1480,40 +1494,44 @@ describe("nudges: inviting the model to use the list", () => {
   const lastText = (payload: { messages: unknown[] }) =>
     JSON.stringify((payload.messages[payload.messages.length - 1] as Record<string, unknown>)["content"])
 
-  test("a session with no list gets one invitation at the first unseen turn, then one per `staleAfter` requests", async () => {
+  test("a session with no list gets one invitation, in the host's reminder shell", async () => {
     const { todo } = core()
     const first = request([turn("m1")])
     expect(await injectTail(todo, first, settings)).toBe(true)
     expect(lastText(first)).toContain("no list yet")
     // An offer, not an order: it says the tool is available, and never tells the
-    // model to call anything.
-    expect(lastText(first)).toBe('[{"type":"text","text":"[focus_todo] no list yet"}]')
+    // model to call anything. The shell is the host's own convention for
+    // harness-authored text, so the tail cannot be read as something the user typed.
+    expect(lastText(first)).toBe('[{"type":"text","text":"<system-reminder>\\n[focus_todo] no list yet\\n</system-reminder>"}]')
     expect(lastText(first)).not.toContain("replace")
 
-    // Same session, next turn: one request of quiet is nowhere near the threshold.
+    // Same session, next turn: the invitation is not a cadence, it never repeats.
     const second = request([turn("m1"), turn("m2")])
     expect(await injectTail(todo, second, settings)).toBe(false)
     expect(second.messages.length).toBe(2)
   })
 
-  test("the invitation is never rationed: it returns on the cadence for as long as there is no list", async () => {
-    const { todo } = core()
-    // `staleAfter: 2` with two quiet requests between turns, so every turn start is
-    // stale. The old per-session cap of 3 would have stopped the line here.
-    const fired: number[] = []
-    for (let round = 0; round < 10; round += 1) {
-      for (let quiet = 0; quiet < 2; quiet += 1) await injectTail(todo, request([toolResult(`q${round}-${quiet}`)]), settings)
-      const payload = request([turn(`t${round}`)])
-      if (await injectTail(todo, payload, settings)) {
-        fired.push(round)
-        expect(lastText(payload)).toContain("no list yet")
+  test("the invitation lands once per session, whatever `staleAfter` says", async () => {
+    // `staleAfter: 0` is the shipped default and the setting most configurations use.
+    // The invitation used to be behind it, so a fresh session got no reminder at all —
+    // measured on a real session: the model only ever learned about the tool from its
+    // definition. It is now its own once-per-session event: 24 characters, then quiet.
+    for (const policy of [{ ...DEFAULT_SETTINGS, staleAfter: 0 }, settings]) {
+      // The cadence memo is process-wide (keyed by session), so each policy starts
+      // from a fresh process's point of view rather than inheriting `invited`.
+      resetHookRegistration()
+      const { todo } = core()
+      const fired: number[] = []
+      for (let round = 0; round < 10; round += 1) {
+        for (let quiet = 0; quiet < 2; quiet += 1) await injectTail(todo, request([toolResult(`q${round}-${quiet}`)]), policy)
+        const payload = request([turn(`t${round}`)])
+        if (await injectTail(todo, payload, policy)) {
+          fired.push(round)
+          expect(lastText(payload)).toContain("no list yet")
+        }
       }
+      expect(fired).toEqual([0])
     }
-    expect(fired).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
-
-    // And it still cannot land twice in a row: a fired nudge resets the cadence.
-    const immediate = request([turn("m1"), turn("m2")])
-    expect(await injectTail(todo, immediate, settings)).toBe(false)
   })
 
   test("with a list, the nudge is a clause on the state line, spaced by `staleAfter`", async () => {
@@ -1541,6 +1559,79 @@ describe("nudges: inviting the model to use the list", () => {
     expect(lastText(stale)).toContain("update if changed")
   })
 
+  test("an unchanged list is re-stated in its short form until it moves", async () => {
+    const { todo } = core()
+    const off = { ...DEFAULT_SETTINGS, staleAfter: 0 }
+    await todo.run(SESSION, {
+      action: "replace",
+      items: [
+        { text: "implement the storage layer", status: "in_progress" },
+        { text: "write regression tests", status: "pending" },
+        { text: "document the reminder cadence", status: "pending" },
+      ],
+    })
+
+    const first = request([turn("m1")])
+    expect(await injectTail(todo, first, off)).toBe(true)
+    const full = (JSON.parse(lastText(first)) as Array<{ text: string }>)[0]!.text
+    // A plain state line carries no instruction, so it is not wrapped in the host's
+    // `<system-reminder>` shell: it asserts facts, and the shell cost 37 characters on
+    // every single turn for no gain there.
+    expect(full.startsWith("[focus_todo] 3 open: t1> implement")).toBe(true)
+    expect(full).not.toContain("system-reminder")
+
+    // Nothing moved: same anchor, fewer tokens, and the word that says so.
+    const second = request([turn("m1"), turn("m2")])
+    expect(await injectTail(todo, second, off)).toBe(true)
+    const short = (JSON.parse(lastText(second)) as Array<{ text: string }>)[0]!.text
+    expect(short).toContain("3 open, unchanged: t1> implement the storage layer")
+    expect(short.length).toBeLessThan(full.length)
+
+    // A change brings the whole line back.
+    await todo.run(SESSION, { action: "add", text: "trim the reminder output" })
+    const third = request([turn("m2"), turn("m3")])
+    expect(await injectTail(todo, third, off)).toBe(true)
+    const again = (JSON.parse(lastText(third)) as Array<{ text: string }>)[0]!.text
+    expect(again).not.toContain("unchanged")
+    expect(again).toContain("4 open")
+  })
+
+  test("only an instruction is shelled; a state report goes out bare", async () => {
+    // The host's `<system-reminder>` shell says "this is harness text, not the user".
+    // That matters for a message that reads like an order (the invitation, the clause)
+    // and buys nothing for a message that only states facts — which is the form almost
+    // every turn carries. This test pins the split so neither side drifts.
+    const { todo } = core()
+    const off = { ...DEFAULT_SETTINGS, staleAfter: 0 }
+
+    // No list yet → invitation → shelled, and still inside the budget.
+    const invite = request([turn("m1")])
+    expect(await injectTail(todo, invite, off)).toBe(true)
+    const invitation = (JSON.parse(lastText(invite)) as Array<{ text: string }>)[0]!.text
+    expect(invitation.startsWith("<system-reminder>\n[focus_todo] no list yet")).toBe(true)
+    expect(invitation.endsWith("</system-reminder>")).toBe(true)
+    expect(invitation.length).toBeLessThanOrEqual(DEFAULT_SETTINGS.reminderBudget)
+
+    // List exists, no clause due → plain state line → bare, no shell characters paid.
+    await todo.run(SESSION, { action: "add", text: "implement storage", status: "in_progress" })
+    const plain = request([turn("m1"), turn("m2")])
+    expect(await injectTail(todo, plain, off)).toBe(true)
+    const bare = (JSON.parse(lastText(plain)) as Array<{ text: string }>)[0]!.text
+    expect(bare).toBe("[focus_todo] 1 open: t1> implement storage")
+    expect(bare).not.toContain("system-reminder")
+
+    // Clause due (fresh memo, `staleAfter: 2`) → the clause is an instruction → shelled.
+    resetHookRegistration()
+    const stale = request([turn("m3")])
+    expect(await injectTail(todo, stale, settings)).toBe(true)
+    const withClause = (JSON.parse(lastText(stale)) as Array<{ text: string }>)[0]!.text
+    expect(withClause.startsWith("<system-reminder>\n[focus_todo] 1 open: t1> implement storage"))
+      .toBe(true)
+    expect(withClause).toContain("update if changed")
+    expect(withClause.endsWith("</system-reminder>")).toBe(true)
+    expect(bare.length).toBeLessThan(withClause.length)
+  })
+
   test("using the tool resets the cadence, so a working session is never nudged", async () => {
     const { todo } = core()
     await todo.run(SESSION, { action: "add", text: "implement storage" })
@@ -1557,12 +1648,15 @@ describe("nudges: inviting the model to use the list", () => {
     }
   })
 
-  test("staleAfter: 0 keeps the informative reminder and drops every nudge", async () => {
+  test("staleAfter: 0 keeps the informative reminder, drops the clause, keeps the invitation", async () => {
     const { todo } = core()
     const off = { ...DEFAULT_SETTINGS, staleAfter: 0 }
 
+    // The invitation is not a nudge in the cadence sense: it is how a session that has
+    // no list ever hears about the tool at all.
     const noList = request([turn("m1")])
-    expect(await injectTail(todo, noList, off)).toBe(false)
+    expect(await injectTail(todo, noList, off)).toBe(true)
+    expect(lastText(noList)).toContain("no list yet")
 
     await todo.run(SESSION, { action: "add", text: "implement storage" })
     await injectTail(todo, request([toolResult("a")]), off)
@@ -1692,7 +1786,7 @@ describe("nudges: inviting the model to use the list", () => {
       typeof last.content === "string"
         ? last.content
         : (last.content as Array<{ text?: string }>).map((part) => part.text ?? "").join("")
-    expect(text.endsWith(clause)).toBe(true) // whole clause, untouched
+    expect(text.endsWith(`${clause}\n</system-reminder>`)).toBe(true) // whole clause, untouched
     const settings = resolveSettings({ maintenanceNudge: clause }, {})
     expect(settings.maintenanceNudge).toBe(clause)
     const worst = DEFAULT_SETTINGS.reminderBudget - 80 + settings.maintenanceNudge.length

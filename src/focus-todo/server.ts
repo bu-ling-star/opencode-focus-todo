@@ -504,6 +504,21 @@ export function formatState(state: TodoState): string {
 /** Room reserved for the "+k more" suffix so a clipped list never hides its own clipping. */
 const REMINDER_TAIL_RESERVE = 12
 
+/**
+ * The shell the injected *instruction* travels in — the invitation, or a state line with the
+ * maintenance clause on it. `<system-reminder>` is the host's own convention for
+ * harness-authored text (its system prompt: "`<system-reminder>` blocks are harness
+ * instructions, not user-authored content. Read and follow them."), which is exactly what an
+ * instruction is. A plain state line goes out bare: it asserts facts, and charging every turn
+ * 37 characters to label a fact was paying for nothing. Where it is used, its length is
+ * charged to the reminder budget, so the whole injected message stays inside `reminderBudget`.
+ */
+const REMINDER_WRAP = { open: "<system-reminder>\n", close: "\n</system-reminder>" } as const
+const REMINDER_WRAP_LENGTH = REMINDER_WRAP.open.length + REMINDER_WRAP.close.length
+
+/** Floor for the reminder *line* itself: small enough that the shell and a clause still fit inside the configured budget. */
+const REMINDER_LINE_MIN = 24
+
 /** What deserves the model's attention first: what is running, then what is stuck. */
 const ATTENTION_RANK: Record<TodoStatus, number> = { in_progress: 0, blocked: 1, pending: 2 }
 
@@ -528,7 +543,7 @@ export function formatReminder(
   const open = openItems(state)
   if (open.length === 0) return undefined
   // Defensive: a caller must not be able to turn the bound off by passing a non-number.
-  const limited = Number.isFinite(budget) ? Math.max(REMINDER_BUDGET_MIN, Math.round(budget)) : DEFAULT_SETTINGS.reminderBudget
+  const limited = Number.isFinite(budget) ? Math.max(REMINDER_LINE_MIN, Math.round(budget)) : DEFAULT_SETTINGS.reminderBudget
 
   const done = state.completed > 0 ? `, ${state.completed} done` : ""
   const head = `[${TOOL_NAME}] ${open.length} open${done}: `
@@ -550,6 +565,41 @@ export function formatReminder(
   const omitted = ordered.length - parts.length
   const line = head + parts.join(" | ") + (omitted > 0 ? ` | +${omitted} more` : "")
   return line.length > limited ? `${line.slice(0, limited - 1)}…` : line
+}
+
+/**
+ * The reminder for a turn where the list did not move since the last one: the
+ * counts, the word `unchanged`, and the single item that deserves attention.
+ *
+ * Repeating an identical sentence every turn costs the same tokens and teaches
+ * the reader to skim it, which is the opposite of what this plugin is for. The
+ * shorter form keeps the anchor (there is a plan, here is what is running, here
+ * is how much is left) and states plainly that nothing moved; any change brings
+ * the full line back, and the other ids are one `list` call away.
+ */
+export function compactReminder(
+  state: TodoState,
+  budget: number = DEFAULT_SETTINGS.reminderBudget,
+  itemChars: number = DEFAULT_SETTINGS.itemChars,
+): string | undefined {
+  const open = openItems(state)
+  const first = [...open].sort((a, b) => ATTENTION_RANK[a.status] - ATTENTION_RANK[b.status])[0]
+  if (first === undefined) return undefined
+  const limited = Number.isFinite(budget) ? Math.max(REMINDER_LINE_MIN, Math.round(budget)) : DEFAULT_SETTINGS.reminderBudget
+  const done = state.completed > 0 ? `, ${state.completed} done` : ""
+  const head = `[${TOOL_NAME}] ${open.length} open${done}, unchanged: `
+  const text = first.text.length > itemChars ? `${first.text.slice(0, itemChars - 1)}…` : first.text
+  const line = `${head}${first.id}${MARK[first.status]} ${text}`
+  return line.length > limited ? `${line.slice(0, limited - 1)}…` : line
+}
+
+/**
+ * Equality check for "the list did not move": every id, status and text, plus
+ * the finished count. Cheap, and independent of object identity, so a state
+ * re-read from storage compares equal to the one that produced the last line.
+ */
+export function stateSignature(state: TodoState): string {
+  return `${state.items.map((item) => `${item.id}${item.status}:${item.text}`).join("\u0000")}|${state.completed}`
 }
 
 function fail(error: string): ActionFailure {
@@ -869,6 +919,10 @@ interface SessionMemo {
   lastTurn?: string
   /** Requests since the last nudge, used only when nudges are explicitly enabled. */
   idle: number
+  /** `stateSignature` of the list the last reminder was built from. */
+  signature?: string
+  /** Whether this session has already been invited to make a list (once is enough). */
+  invited?: boolean
 }
 const memos = new Map<string, SessionMemo>()
 
@@ -924,9 +978,16 @@ function lastHostRoleIsUser(messages: unknown[]): boolean {
  * earlier messages) keeps its exact bytes, and the reminder is regenerated from
  * storage at eligible user-turn starts, which is what makes it survive a compaction.
  *
- * The informative reminder is added once at the start of a user turn. Tool and assistant
- * continuations return before storage access. Optional nudge cadence is updated in memory
- * only, and remains disabled by the shipped `staleAfter: 0` default.
+ * The informative reminder is added once at the start of a user turn, and is shortened to
+ * its `unchanged` form when the list did not move since the previous one. Only a message
+ * that carries an *instruction* (the invitation, the maintenance clause) travels in the
+ * host's `<system-reminder>` shell; the plain state line goes out bare, because it is a
+ * statement of fact rather than something that could be misread as an order, and it is the
+ * form sent on almost every turn. Tool and assistant continuations return before
+ * storage access. The optional ``maintenanceNudge`` cadence is updated in memory only
+ * and stays off under the shipped `staleAfter: 0`; the once-per-session invitation to
+ * create a list is independent of it, because a session that never made a list would
+ * otherwise never see any reminder at all.
  *
  * Best-effort by construction: any missing field or unexpected shape means no
  * reminder, never a failed request.
@@ -954,7 +1015,7 @@ export async function injectTail(
     if (key === undefined) return false
     const newest = asRecord(messages[messages.length - 1])
     if (!newest || isOwnReminderMessage(newest)) return false
-    const nudges = settings.staleAfter > 0
+    const trackIdle = settings.staleAfter > 0
     const previous = recallMemo(key)
     const turn = typeof newest.id === "string" ? newest.id : undefined
     if (turn !== undefined && previous?.lastTurn === turn) return false
@@ -962,7 +1023,7 @@ export async function injectTail(
     // Tool/assistant continuations are not new user turns. With the default
     // settings this path avoids even reading persistent todo state.
     if (!lastHostRoleIsUser(messages)) {
-      if (nudges) storeMemo(key, { ...previous, idle: (previous?.idle ?? 0) + 1 })
+      if (trackIdle) storeMemo(key, { ...previous, idle: (previous?.idle ?? 0) + 1 })
       return false
     }
 
@@ -973,26 +1034,59 @@ export async function injectTail(
 
     const idle = memo?.idle ?? 0
     const isSubagent = typeof request.agent === "string" && subagents?.has(request.agent) === true
+    const hasList = state.items.length > 0
+    // The invitation is not a cadence nudge: a session that never made a list would
+    // otherwise never hear from this plugin (measured with the shipped
+    // `staleAfter: 0`: a fresh session got no reminder at all, only the tool
+    // definition). It spends its ~24 characters once per session, then stays quiet,
+    // while the recurring `maintenanceNudge` clause remains behind `staleAfter`.
+    const invited = memo?.invited === true
+    const stale = settings.staleAfter > 0 && (memo === undefined || idle >= settings.staleAfter)
     let nudge: "create" | "maintain" | undefined
-    if (nudges && !isSubagent && (memo === undefined || idle >= settings.staleAfter)) {
-      nudge = state.items.length === 0 ? "create" : "maintain"
+    if (!isSubagent) {
+      if (!hasList && !invited) nudge = "create"
+      else if (hasList && stale) nudge = "maintain"
     }
     // The clause is the user's own wording, used as written (see `reminderBudget`):
     // a long one may push the line past the budget rather than being cut.
     const clause = nudge === "maintain" ? settings.maintenanceNudge : ""
-    const line = nudge === "create" ? settings.creationNudge : formatReminder(state, settings.reminderBudget - clause.length, settings.itemChars)
+    // Only an instruction travels in the shell. A bare `[focus_todo] 3 open: …` line read
+    // as something the user typed is still a true statement, and it is what almost every
+    // turn carries — so spending 37 characters of shell on it bought nothing. The
+    // invitation and the maintenance clause do read like an order, so they keep the
+    // host's marker for harness-authored text.
+    const shelled = nudge !== undefined
+    const budget = settings.reminderBudget - clause.length - (shelled ? REMINDER_WRAP_LENGTH : 0)
+    const signature = stateSignature(state)
+    // An unchanged list is re-stated in its short form: same anchor, fewer tokens,
+    // and no verbatim repeat for the reader to start skimming.
+    const unchanged = nudge === undefined && memo?.signature === signature
+    const line =
+      nudge === "create"
+        ? settings.creationNudge
+        : ((unchanged ? compactReminder(state, budget, settings.itemChars) : undefined) ??
+          formatReminder(state, budget, settings.itemChars))
     if (line === undefined) {
-      storeMemo(key, { lastTurn: turn, idle: idle + 1 })
+      storeMemo(key, { lastTurn: turn, idle: idle + 1, signature, invited })
       return false
     }
-    const reminder = line + clause
+    // `<system-reminder>` is the host's own convention for harness-authored text: the
+    // system prompt says so verbatim ("`<system-reminder>` blocks are harness
+    // instructions, not user-authored content. Read and follow them."). It is spent
+    // only where it changes how the line reads: an instruction, not a state report.
+    const reminder = shelled ? `${REMINDER_WRAP.open}${line}${clause}${REMINDER_WRAP.close}` : line
     messages.push({
       id: `focus-todo-${Date.now().toString(36)}`,
       role: "user",
       content: typeof newest.content === "string" ? reminder : [{ type: "text", text: reminder }],
       metadata: asRecord(newest.metadata) ?? {},
     })
-    storeMemo(key, { lastTurn: turn, idle: nudge === undefined ? idle + 1 : 0 })
+    storeMemo(key, {
+      lastTurn: turn,
+      idle: nudge === undefined ? idle + 1 : 0,
+      signature,
+      invited: invited || nudge === "create",
+    })
     return true
   } catch {
     return false

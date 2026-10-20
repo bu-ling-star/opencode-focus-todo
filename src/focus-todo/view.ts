@@ -229,6 +229,10 @@ export function toHex(raw: unknown): string | undefined {
  *    removed one by one, so the count is all there is; `all done` over an empty body
  *    would read like a rendering bug)
  *  - otherwise                          → the counts plus every row, marked rows last
+ *
+ * The header names what is running as well as what is open (`Focus 3 active · 1 running`):
+ * the running count is the one thing a glance at the sidebar should answer, and it is
+ * already in the rows rather than guessed.
  */
 export function buildPanel(view: FocusView | undefined, width: number = MAX_ROW_WIDTH): Panel {
   const rowsOf = (items: readonly ViewItem[]): PanelRow[] =>
@@ -242,13 +246,15 @@ export function buildPanel(view: FocusView | undefined, width: number = MAX_ROW_
   }
 
   if (view.active === 0) {
-    if (view.items.length > 0) return { header: "Focus: all done", rows: rowsOf(view.items) }
+    if (view.items.length > 0) return { header: clip("Focus: all done", width), rows: rowsOf(view.items) }
     return { header: clip(`Focus 0 active, done ${view.done}`, width), rows: [] }
   }
 
+  const running = view.items.filter((item) => item.status === "in_progress").length
   const suffix = view.done > 0 ? `, done ${view.done}` : ""
+  const busy = running > 0 ? ` · ${running} running` : ""
   return {
-    header: clip(`Focus ${view.active} active${suffix}`, width),
+    header: clip(`Focus ${view.active} active${suffix}${busy}`, width),
     rows: rowsOf(view.items),
   }
 }

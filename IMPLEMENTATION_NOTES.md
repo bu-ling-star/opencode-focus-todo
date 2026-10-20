@@ -818,8 +818,9 @@ both gated on a **user turn start** and on the list being idle:
 
 Cadence lives in a per-session in-memory memo (`idle`, `creation`): anything that shows the
 model just used the list resets `idle`, and a fired nudge resets it too, so invitations are
-never two turns in a row. `staleAfter: 0` turns both forms off and leaves the informative
-reminder untouched. 127 unit tests cover the parse/clamp of the new key, the two forms, the
+never two turns in a row. `staleAfter: 0` turns the maintenance clause off and leaves the
+informative reminder untouched; **since §9.22 the invitation is no longer one of its forms** —
+it fires once per session on its own. 127 unit tests cover the parse/clamp of the new key, the two forms, the
 spacing, the per-session cap, the reset-on-use and the turn-start gate.
 
 Wire evidence (`verify/wire-nudge.jsonl`, `verify/cache-report-nudge.json`, `staleAfter: 2` to
@@ -889,7 +890,7 @@ key's default, and broken JSON falls back to all defaults. The file shipped in
 | --- | --- | --- |
 | steady state, informing | **0** — exactly the line the plugin always appended | every request |
 | stale user turn start, list exists | +26 chars ≈ 6 tokens (`— update it if it changed`) | at most every `staleAfter` requests, turn starts only |
-| session with no list yet | 99 chars ≈ 25 tokens *instead of* a 0-char state line | ≤ `creationNudgeMax` = 3 per session |
+| session with no list yet | 99 chars ≈ 25 tokens *instead of* a 0-char state line | ≤ `creationNudgeMax` = 3 per session (since §9.22: once per session, independent of `staleAfter`) |
 | plugin process | one memo entry per session (~100 bytes), 512 entries max, oldest evicted | — |
 | cache prefix | unchanged: 12/12 checks pass, tool definitions and system prompt byte-identical, one appended message, prefix reuse intact | `verify/cache-report-cfgtext.json` |
 
@@ -1353,6 +1354,84 @@ as its old version until the file name changed; `Bun.write(…, {append: true})`
 than appended in this host, which is why the probe writes one line per process; the WorkBuddy
 PowerShell tool needs `Start-Process` **without** `-NoNewWindow` when redirecting opencode.exe
 output, and its sandbox refuses `%TEMP%` paths (scratch files live in `_evidence/wire/`).
+
+
+### 9.22 Twelfth round — an invitation that always arrives, a host-shaped shell, and a delta line
+
+The review of the shipped plugin (v0.2.2) had shown the reminder was small but missable: with
+`staleAfter: 0` — the setting in the deployed config — a fresh session never received the
+invitation at all, so the tool could go unnoticed for a whole session. Three changes, all
+measured on the wire.
+
+**1. The invitation is its own cadence.** `SessionMemo` gained an `invited` flag; the
+invitation now fires **once per session** (and still only on a user turn start, still silent in
+subagent sessions) regardless of `staleAfter`, while the maintenance clause keeps the
+`staleAfter` rhythm. The settings doc and its comments were updated to say so, and the
+invitation text is unchanged (`no list yet — for a multi-step turn, record the plan …`).
+Verified end to end on the real host (2.0.32, `staleAfter: 0`, `tmp/probe/wire-delta.jsonl`):
+the very first agent request of a fresh session carries
+`[focus_todo] no list yet` as its last message, and it does not come back on later turns
+once a list exists.
+
+**2. Only an instruction travels in a shell.** The reminder is a fake `role: "user"` message,
+and two of its forms read like an order: the invitation (`no list yet — … record the plan …`)
+and the maintenance clause (`— update if changed`). Those are now sent inside the host's own
+convention, `"<system-reminder>\n" + line + "\n</system-reminder>"` (`REMINDER_WRAP`), which
+is the literal form the host's system prompt teaches: “`… <system-reminder>` blocks are harness
+instructions, not user-authored content. Read and follow them.” A **plain state line is sent
+bare**: read as something the user typed it is still a true statement, and it is the form
+almost every turn carries — 37 characters of shell on every turn bought nothing there. (This
+started out wrapping every message; the deployed config showed why that was the wrong trade —
+see the cost table below.) The shell's length is subtracted from `reminderBudget` only when it
+is used, and both branches are pinned by the test “only an instruction is shelled; a state
+report goes out bare”.
+
+**3. An unchanged list says so, and says less.** A per-session signature (item ids, statuses
+and clipped texts, `stateSignature` in `server.ts`) is compared with the previous injection;
+when the plan has not moved, only the highest-attention entry is printed after
+`unchanged: ` (`compactReminder`). Measured with `tmp/probe/measure3.ts` (worst case, 500-char
+items, `itemChars: 48`, state line only — the shell is not part of these numbers):
+
+| List | Full line | Unchanged line | Saving |
+| --- | --- | --- | --- |
+| 2 items | 58 chars | 53 chars | −9 % |
+| 4 items (+2 done) | 193 chars | 83 chars | −57 % |
+| 8 items | 334 chars | 75 chars | −78 % |
+
+It never truncates below one entry: the first row is the row the model is working on, and
+dropping it would defeat the purpose. Host-counted tokens on the real capture
+(`tmp/probe/wire-shell.jsonl`): invitation 15 (shell included), full line 15, unchanged line
+14 — the delta is worth ~50 characters from four rows up, and the plain line is now *cheaper*
+than the pre-shell version it replaced plus the shell (74 → 58 for two items).
+
+**4. The panel header shows what is running.** `▼ Focus 3 active, done 2 · 1 running` (the
+running count only when non-zero, appended in `buildPanel`, `src/focus-todo/view.ts:252-260`),
+so a folded or glanceable panel answers “is the plan moving” without expanding. Confirmed in
+a real 200-column frame (probe plugin id `focus-todo-probe`, `tmp/e2e`):
+`▼ Focus 2 active · 1 running`. A blocked count was considered and left out: at 37 content
+columns three counts plus the glyph already clip, and a stuck row is marked `!` in the body
+the same glance shows.
+
+**Cost accounting for the whole round**, per user turn: the plain state line is unchanged from
+v0.2.2 (2 items: 58 chars; 4 items: 193), the `, unchanged` form saves ~50 characters from
+four rows up, and the only *new* per-turn cost is zero — the 37-character shell is spent on
+the invitation (once per session) and on a stale turn start (`staleAfter`, off in the shipped
+config). The tool definition (1 739 B ≈ 430 tokens, cached) is unchanged.
+
+**Verification**: 192 unit tests pass (4 files), `tsc --noEmit` clean; two wire captures, each
+with 4 agent requests across 3 typed turns in one TUI process (`tmp/probe/wire-delta.jsonl`,
+`tmp/probe/wire-shell.jsonl` — the second one after the shell was narrowed to instructions);
+after stripping the request-scoped injection, every request's message list is a
+**byte-identical prefix** of the next one — the cache prefix is intact (same method as §9.14).
+Tail shapes on the wire, in order: shelled invitation, nothing on the tool continuation, bare
+full line, bare `unchanged` line. The deployed copy in `~/.config/opencode/plugins/focus-todo/`
+was re-synced and MD5-matched (`server.ts` 04ED1792, `view.ts` F9C50983, `tui.tsx` 0BE10BE5).
+
+Honest caveats: the delta compares against what *this plugin* last injected, so after a
+restart (or a second process) the first turn of a session always sends the full line — which
+is what you want for a cold model. And a list that changes on every turn (the healthy case)
+still pays the full line every turn; the delta only helps the *stuck* case, which is exactly
+the case where the model has stopped paying attention.
 
 
 ## 10. Known limitations

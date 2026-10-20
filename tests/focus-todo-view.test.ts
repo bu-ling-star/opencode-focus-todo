@@ -318,13 +318,26 @@ describe("buildPanel", () => {
 
   test("renders a header plus one row per open item", () => {
     const panel = buildPanel(view(2, 5))
-    expect(panel?.header).toBe("Focus 2 active, done 5")
+    expect(panel?.header).toBe("Focus 2 active, done 5 · 1 running")
     expect(panel?.rows.map((row) => row.line)).toEqual(["▶ t1 item 1", "○ t2 item 2"])
     expect(panel?.rows[0]?.status).toBe("in_progress")
   })
 
   test("omits the done counter when nothing has finished", () => {
-    expect(buildPanel(view(1, 0))?.header).toBe("Focus 1 active")
+    expect(buildPanel(view(1, 0))?.header).toBe("Focus 1 active · 1 running")
+  })
+
+  test("names the running count, and says nothing about it when nothing runs", () => {
+    const quiet = buildPanel({
+      active: 2,
+      done: 0,
+      items: [
+        { id: "t1", status: "blocked", text: "wait for review" },
+        { id: "t2", status: "pending", text: "next" },
+      ],
+    })
+    expect(quiet?.header).toBe("Focus 2 active")
+    expect(buildPanel(view(3, 1))?.header).toBe("Focus 3 active, done 1 · 1 running")
   })
 
   test("keeps every row inside the requested width", () => {
