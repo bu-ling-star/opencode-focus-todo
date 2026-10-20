@@ -24,7 +24,7 @@
  */
 import { For, Show, createMemo, createSignal } from "solid-js"
 import { MAX_ROW_WIDTH, buildPanel, clip, isFoldStorePair, latestFocusState, toHex } from "./view.ts"
-import type { PanelRow, ViewStatus } from "./view.ts"
+import type { FocusView, PanelRow, ViewStatus } from "./view.ts"
 
 /**
  * Minimal hand-written view of the parts of the v2 TUI plugin API this file
@@ -79,6 +79,9 @@ interface TuiContext {
     slot(claim: {
       readonly prepend?: string
       readonly append?: string
+      readonly before?: string
+      readonly after?: string
+      readonly replace?: string
       readonly render: (input: TuiPanelInput) => unknown
     }): unknown
   }
@@ -86,6 +89,40 @@ interface TuiContext {
 
 /** Below this the panel would be noise; keep at least a status word visible. */
 const MIN_ROW_WIDTH = 14
+
+/**
+ * The sidebar is a fixed 42 columns wide in the host's session layout (its container sets
+ * `width: 42` with `paddingLeft: 2` / `paddingRight: 2`, and the content box adds one more
+ * column of `paddingRight`), so 37 content columns are all a sidebar row can ever use.
+ *
+ * This used to be `terminalWidth / 3 - 2`, which is 64 columns on a 200-column terminal:
+ * `clip()` therefore never fired, and the host hard-truncated long rows mid-word with no
+ * ellipsis. Measured on a captured 200x50 frame — the panel's rows occupy columns 160–197
+ * and a 58-character item ended at `…layer with` with nothing to show it was cut.
+ */
+const SIDEBAR_ROW_WIDTH = 37
+
+/**
+ * The newest `focus_todo` result can leave the window the TUI holds (the host keeps the
+ * last 20 messages by default), which used to blank the panel to `暂无待办` while a list
+ * was plainly in use. Remembering the last parsed state per session keeps the panel
+ * honest; the map is memory only and bounded, and a cleared list still refreshes it
+ * because a cleared result parses as a normal `0 active, done=0` dump.
+ */
+const MEMORY_LIMIT = 64
+const remembered = new Map<string, FocusView>()
+
+function remember(sessionID: string, view: FocusView | undefined): FocusView | undefined {
+  if (view === undefined) return remembered.get(sessionID)
+  if (remembered.size >= MEMORY_LIMIT && !remembered.has(sessionID)) remembered.clear()
+  remembered.set(sessionID, view)
+  return view
+}
+
+/** Test seam: forget every remembered panel state. */
+export function forgetPanelState(): void {
+  remembered.clear()
+}
 
 /** Where the folded flag persists. One key, one boolean, nothing else. */
 const FOLD_KEY = "focus-todo.panel"
@@ -133,16 +170,16 @@ function createFold(context: TuiContext): Fold {
 }
 
 /**
- * The sidebar pane is about a third of the terminal, and the host hides it
- * entirely on narrow terminals, so a share of the terminal width is a safe
- * budget. Rows are clipped to it; the host may still wrap when the actual slot
- * is narrower than the renderer's reported terminal width.
+ * The sidebar is a fixed-width pane of the host's own session layout — it is not a share
+ * of the terminal, so a constant budget is what actually fits. The terminal width only
+ * matters when it is smaller than the sidebar would need.
  */
 function rowWidth(terminalWidth: unknown): number {
-  if (typeof terminalWidth !== "number" || !Number.isFinite(terminalWidth) || terminalWidth <= 0) {
-    return MIN_ROW_WIDTH
-  }
-  return Math.max(MIN_ROW_WIDTH, Math.min(MAX_ROW_WIDTH, Math.floor(terminalWidth / 3) - 2))
+  const limit =
+    typeof terminalWidth === "number" && Number.isFinite(terminalWidth) && terminalWidth > 0
+      ? Math.min(SIDEBAR_ROW_WIDTH, Math.floor(terminalWidth))
+      : SIDEBAR_ROW_WIDTH
+  return Math.max(MIN_ROW_WIDTH, Math.min(MAX_ROW_WIDTH, limit))
 }
 
 function statusColor(theme: TuiTextTheme | undefined, status: ViewStatus): string | undefined {
@@ -174,8 +211,7 @@ function FocusTodoPanel(props: { readonly context: TuiContext; readonly input: T
         return buildPanel(undefined, width())
       }
       const messages = props.context.data?.session?.message?.list(sessionID) ?? []
-      const view = latestFocusState(messages)
-      return buildPanel(view, width())
+      return buildPanel(remember(sessionID, latestFocusState(messages)), width())
     } catch {
       // A failed read must never take the sidebar down with it.
       return buildPanel(undefined, width())
@@ -210,11 +246,12 @@ const mod = {
     if (typeof context?.ui?.slot !== "function") return undefined
     if (typeof context.data?.session?.message?.list !== "function") return undefined
 
-    // `append` keeps the panel after the session header, alongside the built-in
-    // contributions; the host consumes both prepend and append claims through the
-    // same slot tree, and append matches what every shipped panel uses.
+    // `after` pins the panel below every `append` claim (e.g. the cli.json plugins
+    // such as opencode-user-timeline): the host renders slot content in the order
+    // before → prepend → children → append → after, so `after` is the only way a
+    // locally-discovered plugin can sit at the very bottom.
     const unregister = context.ui.slot({
-      append: "sidebar.content",
+      after: "sidebar.content",
       render: (input) => <FocusTodoPanel context={context} input={input} />,
     })
 

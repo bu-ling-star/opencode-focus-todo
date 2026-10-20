@@ -111,7 +111,12 @@ export const KEY_PREFIX = "focus-todo/session/"
 export interface Settings {
   /** Append the current list as the last message of the tail. */
   reminder: boolean
-  /** Upper bound for that one line, in characters. Includes any nudge clause. */
+  /**
+   * Bound for the generated state line, in characters. A custom nudge clause is
+   * subtracted from it when there is room; the clause itself is the user's own
+   * wording and is never truncated, so a very long clause can push the assembled
+   * line past this bound (worst case `REMINDER_BUDGET_MIN + NUDGE_TEXT_MAX`).
+   */
   reminderBudget: number
   /**
    * How many requests without list activity may pass before a turn start carries an
@@ -251,7 +256,8 @@ export async function loadSettings(
 export const TOOL_DESCRIPTION =
   'Session focus list for multi-step work. For 3+ steps, start with action="replace"; skip trivial work. ' +
   'Use action="list" on resume/compaction/restart, or action="mutate" with 1–24 add/update/remove ops. ' +
-  'Keep items short; set one in_progress before work; set done:true only after verification, leaving partial, blocked, or failing work open.'
+  'Keep items short; set one in_progress before work; set done:true only after verification, leaving partial, blocked, or failing work open. ' +
+  'Results mark each row as > running, - pending, ! blocked, x done.'
 
 const STATUSES: readonly TodoStatus[] = ["pending", "in_progress", "blocked"]
 const MARK: Record<TodoStatus, string> = { in_progress: ">", pending: "-", blocked: "!" }
@@ -391,10 +397,15 @@ export function normalizeState(raw: unknown): { state: TodoState; corrupt: boole
     if (typeof item.text !== "string" || item.text.length === 0) return { state: emptyState(), corrupt: true }
     if (!isTodoStatus(item.status)) return { state: emptyState(), corrupt: true }
     if (seen.has(item.id)) return { state: emptyState(), corrupt: true }
+    // Same normalisation the write path applies (`cleanText`): a stored newline or tab
+    // would break the one-row-per-item shape of both the result and the reminder, and
+    // leave the panel unable to parse the dump it reads back.
+    const text = item.text.trim().replace(/\s+/g, " ")
+    if (text.length === 0) return { state: emptyState(), corrupt: true }
     seen.add(item.id)
     items.push({
       id: item.id,
-      text: item.text.slice(0, MAX_TEXT),
+      text: text.slice(0, MAX_TEXT),
       status: item.status,
       done: item.done === true,
     })
@@ -931,9 +942,9 @@ export async function injectTail(
   try {
     if (!settings.reminder) return false
     const request = asRecord(payload)
-    const messages = request?.messages
+    if (request === undefined) return false
+    const messages = request.messages
     if (!Array.isArray(messages) || messages.length === 0) return false
-    if (!request) return false
     const key = sessionKey(request.sessionID)
     if (key === undefined) return false
     const newest = asRecord(messages[messages.length - 1])
@@ -961,6 +972,8 @@ export async function injectTail(
     if (nudges && !isSubagent && (memo === undefined || idle >= settings.staleAfter)) {
       nudge = state.items.length === 0 ? "create" : "maintain"
     }
+    // The clause is the user's own wording, used as written (see `reminderBudget`):
+    // a long one may push the line past the budget rather than being cut.
     const clause = nudge === "maintain" ? settings.maintenanceNudge : ""
     const line = nudge === "create" ? settings.creationNudge : formatReminder(state, settings.reminderBudget - clause.length, settings.itemChars)
     if (line === undefined) {

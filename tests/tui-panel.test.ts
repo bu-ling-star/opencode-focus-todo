@@ -12,7 +12,7 @@
  * Run with `bun test`.
  */
 
-import { describe, expect, mock, test } from "bun:test"
+import { beforeEach, describe, expect, mock, test } from "bun:test"
 
 type Node = { readonly type: unknown; readonly props: Record<string, unknown> }
 
@@ -59,7 +59,11 @@ mock.module("solid-js", () => ({
 }))
 
 const { default: plugin } = await import("../src/focus-todo/tui.tsx")
+const { forgetPanelState } = await import("../src/focus-todo/tui.tsx")
 const { TOOL_NAME } = await import("../src/focus-todo/view.ts")
+
+// The panel remembers the last state it saw per session, so every test starts clean.
+beforeEach(() => forgetPanelState())
 
 const SESSION = "ses_panel0000aaaaaaaaaaaaaaaaaaaaa"
 
@@ -82,7 +86,12 @@ const THEME = {
 
 /** Records slot claims and their render functions. */
 function fakeContext(sessions: Record<string, unknown[]> = {}, options: { foldState?: { open: boolean } } = {}) {
-  const claims: { prepend?: string; append?: string; render: (input: { sessionID?: unknown }) => unknown }[] = []
+  const claims: {
+    prepend?: string
+    append?: string
+    after?: string
+    render: (input: { sessionID?: unknown }) => unknown
+  }[] = []
   let unregistered = 0
   const context = {
     options: {},
@@ -113,7 +122,7 @@ function fakeContext(sessions: Record<string, unknown[]> = {}, options: { foldSt
         }
       : {}),
     ui: {
-      slot(claim: { prepend?: string; append?: string; render: (input: { sessionID?: unknown }) => unknown }) {
+      slot(claim: { prepend?: string; append?: string; after?: string; render: (input: { sessionID?: unknown }) => unknown }) {
         claims.push(claim)
         return () => {
           unregistered += 1
@@ -175,12 +184,15 @@ describe("plugin directory discovery", () => {
 })
 
 describe("sidebar slot", () => {
-  test("claims exactly one slot, appended to sidebar.content", () => {
+  test("claims exactly one slot, pinned after every append claim on sidebar.content", () => {
     const { context, claims } = fakeContext()
     plugin.setup(context)
 
     expect(claims).toHaveLength(1)
-    expect(claims[0]?.append).toBe("sidebar.content")
+    // `after` is what puts the panel below the cli.json plugins: the host renders
+    // before → prepend → children → append → after.
+    expect(claims[0]?.after).toBe("sidebar.content")
+    expect(claims[0]?.append).toBeUndefined()
     expect(typeof claims[0]?.render).toBe("function")
   })
 
@@ -277,6 +289,28 @@ describe("panel rendering", () => {
     ])
   })
 
+  test("keeps showing the last state after its result scrolls out of the window", () => {
+    // The host holds the last 20 messages by default, so a long turn drops the very
+    // focus_todo result the panel reads; blanking to 暂无待办 mid-plan is a lie.
+    const conversation: unknown[] = [
+      { type: "assistant", content: [toolPart("2 active, done=0\nt1:> alpha\nt2:- beta")] },
+    ]
+    const { context, claims } = fakeContext({ [SESSION]: conversation })
+    plugin.setup(context)
+
+    const expected = ["▼ Focus 2 active", "▶ t1 alpha", "○ t2 beta"]
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(expected)
+
+    for (let index = 0; index < 70; index += 1) {
+      conversation.push({ role: "assistant", content: [{ type: "text", text: "x" }] })
+    }
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(expected)
+
+    // A cleared list is a real result and must still replace what was remembered.
+    conversation.push({ type: "assistant", content: [toolPart("0 active, done=0")] })
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ 暂无待办"])
+  })
+
   test("a broken message store degrades to an empty panel, not a throw", () => {
     const { context, claims } = fakeContext()
     const broken = {
@@ -296,17 +330,28 @@ describe("panel rendering", () => {
     expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ 暂无待办"])
   })
 
-  test("clips rows to the terminal budget", () => {
+  test("clips rows to the fixed sidebar budget, with an ellipsis", () => {
     const long = "x".repeat(200)
     const { context, claims } = fakeContext({
       [SESSION]: [{ type: "assistant", content: [toolPart(`1 active, done=0\nt1:> ${long}`)] }],
     })
-    plugin.setup({ ...context, renderer: { terminalWidth: 60 } } as never)
+    plugin.setup({ ...context, renderer: { terminalWidth: 200 } } as never)
 
     const lines = renderText(claims[0]?.render({ sessionID: SESSION }))
     expect(lines).toHaveLength(2)
-    // terminalWidth 60 → row budget 60/3-2 = 18 columns; every line honours it.
-    for (const line of lines) expect(line.length).toBeLessThanOrEqual(18)
+    // The sidebar is a fixed 42 columns wide whatever the terminal is, so the row budget
+    // is a constant 37 — and text that does not fit says so instead of being hard-cut.
+    for (const line of lines) expect(line.length).toBeLessThanOrEqual(37)
+    expect(lines[1]?.endsWith("…")).toBe(true)
+
+    // A terminal narrower than the sidebar itself must still not widen the rows.
+    const narrow = fakeContext({
+      [SESSION]: [{ type: "assistant", content: [toolPart(`1 active, done=0\nt1:> ${long}`)] }],
+    })
+    plugin.setup({ ...narrow.context, renderer: { terminalWidth: 30 } } as never)
+    for (const line of renderText(narrow.claims[0]?.render({ sessionID: SESSION }))) {
+      expect(line.length).toBeLessThanOrEqual(30)
+    }
   })
 
   test("colours in-progress, pending and blocked rows differently", () => {

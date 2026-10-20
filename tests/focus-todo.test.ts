@@ -615,6 +615,26 @@ describe("normalizeState", () => {
     expect(result.corrupt).toBe(true)
   })
 
+  test("stored whitespace is normalised so one item stays one row", () => {
+    // The write path collapses whitespace (`cleanText`) but the read path used to keep it:
+    // a stored newline then produced a two-line result, split the reminder line in two and
+    // left the panel unable to parse its own dump (`parseFocusState` → undefined).
+    const result = normalizeState({
+      version: 1,
+      items: [{ id: "t1", text: "  line one\n\tline two  ", status: "pending" }],
+    })
+    expect(result.corrupt).toBe(false)
+    expect(result.state.items[0]?.text).toBe("line one line two")
+    expect(formatState(result.state)).toBe("1 active, done=0\nt1:- line one line two")
+    expect(formatReminder(result.state)).toBe("[focus_todo] 1 open: t1- line one line two")
+  })
+
+  test("text that is only whitespace is corrupt, not an empty row", () => {
+    const result = normalizeState({ version: 1, items: [{ id: "t1", text: "   \n\t ", status: "pending" }] })
+    expect(result.corrupt).toBe(true)
+    expect(result.state).toEqual(emptyState())
+  })
+
   test("invariant violations are repaired instead of discarded", () => {
     const result = normalizeState({
       version: 1,
