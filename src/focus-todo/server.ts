@@ -32,6 +32,11 @@ export interface TodoItem {
 
 export interface TodoState {
   version: 1
+  /**
+   * Write epoch: advances on every stored mutation, never sent to the model. It is the
+   * cheap consistency check the tests assert on (`revision advances on writes and is
+   * never exposed to the model`), so keep it rather than treat it as dead data.
+   */
   revision: number
   /** Completions in the *current* plan: a `done: true` update adds one, `replace` resets it. */
   completed: number

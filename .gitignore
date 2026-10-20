@@ -2,9 +2,15 @@ node_modules/
 *.log
 
 # Local wire captures and scratch evidence — generated per machine, never shipped
-verify/wire-*.jsonl
+verify/wire*.jsonl
 verify/cache-report*.json
 _evidence/
 .workbuddy/
 .opencode/
-release/
+
+# Scratch harnesses and probe output — generated per machine
+_tmp/
+tmp/
+run.cmd
+verify/script-*.json
+verify/script.json
