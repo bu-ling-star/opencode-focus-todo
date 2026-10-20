@@ -213,6 +213,20 @@ describe("sidebar slot", () => {
     expect(plugin.setup({ ui: { slot: () => () => {} }, data: {} } as never)).toBeUndefined()
     expect(plugin.setup(undefined as never)).toBeUndefined()
   })
+
+  test("a host that throws from slot() costs the panel, not the plugin load", () => {
+    const store = new Map<string, unknown>()
+    const context = {
+      ui: {
+        slot() {
+          throw new Error("slot registry locked")
+        },
+      },
+      data: { session: { message: { list: async (id: string) => store.get(id) ?? [] } } },
+    }
+    // A throw here would fail this test; the contract is that it degrades instead.
+    expect(plugin.setup(context as never)).toBeUndefined()
+  })
 })
 
 describe("panel rendering", () => {

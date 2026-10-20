@@ -114,7 +114,12 @@ const remembered = new Map<string, FocusView>()
 
 function remember(sessionID: string, view: FocusView | undefined): FocusView | undefined {
   if (view === undefined) return remembered.get(sessionID)
-  if (remembered.size >= MEMORY_LIMIT && !remembered.has(sessionID)) remembered.clear()
+  if (remembered.size >= MEMORY_LIMIT && !remembered.has(sessionID)) {
+    // Evict the least recently added entry, not the whole map: clearing everything made the
+    // panel drop back to `暂无待办` in every other session as soon as the limit was reached.
+    const oldest = remembered.keys().next().value
+    if (oldest !== undefined) remembered.delete(oldest)
+  }
   remembered.set(sessionID, view)
   return view
 }
@@ -250,10 +255,18 @@ const mod = {
     // such as opencode-user-timeline): the host renders slot content in the order
     // before → prepend → children → append → after, so `after` is the only way a
     // locally-discovered plugin can sit at the very bottom.
-    const unregister = context.ui.slot({
-      after: "sidebar.content",
-      render: (input) => <FocusTodoPanel context={context} input={input} />,
-    })
+    //
+    // Guarded like every step of the server setup: a host-side change to the slot API
+    // must cost the panel, not abort the TUI plugin load itself.
+    let unregister: unknown
+    try {
+      unregister = context.ui.slot({
+        after: "sidebar.content",
+        render: (input) => <FocusTodoPanel context={context} input={input} />,
+      })
+    } catch {
+      return undefined
+    }
 
     return () => {
       try {

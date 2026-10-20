@@ -145,7 +145,8 @@ TUI
 
 The reminder is never persisted and never changes the system prompt, tool definitions or earlier
 messages. A failed storage read, hook or plugin setup only disables that part; it never breaks the
-request.
+request. A mutation attempted while the store cannot be read is refused rather than written, so a
+transient read failure cannot replace a list it never saw.
 
 ## How the model keeps knowing
 
@@ -166,9 +167,12 @@ It is not appended during assistant/tool continuations. Ordinary user text conta
 `[focus_todo]` cannot suppress it; suppression uses the plugin-generated tail id and the
 user-message id, not arbitrary text matching.
 
-`staleAfter: 0` is the shipped default: no empty-session invitation and no maintenance nudge.
-If explicitly enabled, nudges occur only at user-turn starts and are still suppressed for positively
-identified subagents. This is an opt-in attention aid, not an instruction to create a todo list.
+`staleAfter: 0` is the shipped default: no maintenance nudge. The one thing an empty session
+can still draw is the once-per-session invitation (`creationNudge`), which does not depend on
+`staleAfter` — a session that never builds a list would otherwise never hear from the plugin at
+all. Maintenance nudges, when explicitly enabled, occur only at user-turn starts, and both forms
+are suppressed for positively identified subagents. This is an opt-in attention aid, not an
+instruction to create a todo list.
 
 ### Settings
 
@@ -189,10 +193,10 @@ Optional config: `~/.config/opencode/focus-todo.json` (or next to `server.ts`). 
 | --- | --- | --- |
 | `reminder` | `true` | Enable the request-tail reminder. `false` skips the session hook entirely. |
 | `reminderBudget` | `360` | Maximum generated reminder length in characters. |
-| `staleAfter` | `0` | Number of quiet hook calls before an optional nudge. `0` disables both nudge forms. |
+| `staleAfter` | `0` | Number of quiet hook calls before the optional maintenance nudge. `0` disables that nudge only; the once-per-session invitation is unconditional. |
 | `itemChars` | `48` | Per-item clipping inside the reminder. |
 | `maintenanceNudge` | ` — update if changed` | Optional short clause for an enabled maintenance nudge. |
-| `creationNudge` | `[focus_todo] no list yet` | Optional short line for an enabled empty-session nudge. |
+| `creationNudge` | `[focus_todo] no list yet` | Line for the once-per-session invitation an empty session draws. |
 
 The environment variables `FOCUS_TODO_REMINDER`, `FOCUS_TODO_REMINDER_BUDGET`,
 `FOCUS_TODO_STALE_AFTER` and `FOCUS_TODO_ITEM_CHARS` override file values for tests or
@@ -213,15 +217,14 @@ one-off runs.
   again on the next eligible user turn no matter what happened to the history.
 * It costs nothing when there is nothing to say: a session with no open items gets **no**
   state line, and the line is bounded (`itemChars` per item, `reminderBudget` in total). The
-  only message an empty session can draw is the invitation, and only on its `staleAfter`
-  cadence.
+  only message an empty session can draw is the once-per-session invitation.
 
 ### What it costs, measured
 
 The fixed tool definition lives in the cacheable prefix. The reminder is the only per-request text
 this plugin adds, and it is bounded by `reminderBudget`; with the default `staleAfter: 0`,
-an empty session adds zero reminder tokens and a working session adds at most one short line at a
-user-turn start. Tool results are paid only when the model calls the tool. The sidebar is local UI
+an empty session adds zero reminder tokens (its single invitation aside) and a working session
+adds at most one short line at a user-turn start. Tool results are paid only when the model calls the tool. The sidebar is local UI
 and costs no model tokens.
 
 Use `verify/cost-report.mjs` against a real capture when you need exact provider/token numbers;
@@ -249,8 +252,9 @@ a second todo store.
   domain, one key per session. No plugin JSON file, no database, no migrations.
 * **Failure never blocks startup.** Setup is fully guarded per feature: a failing tool
   registration leaves the reminder and the panel intact, a failing hook costs only the
-  reminder, unreadable state is reset with a warning, and mutations on one session are
-  serialized so nothing is lost.
+  reminder, unreadable state is reset with a warning, a read failure refuses the write
+  instead of overwriting the stored list, and mutations on one session are serialized so
+  nothing is lost.
 * **Coexists with billion-context.** It registers exactly one tool (`focus_todo`), never
   touches billion-context's tools, headers, prompts, config or state, and works normally with
   billion-context removed. The plugin does not edit billion-context settings. If you run

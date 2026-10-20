@@ -95,7 +95,7 @@ describe("parseFocusState", () => {
   })
 
   test("skips a warn= notice that precedes the dump", () => {
-    const parsed = parseFocusState("warn=state store unavailable, list is not persisted\n1 active, done=1\nt1:> keep going")
+    const parsed = parseFocusState("warn=state store unavailable, list not loaded\n1 active, done=1\nt1:> keep going")
     expect(parsed?.items).toEqual([{ id: "t1", status: "in_progress", text: "keep going" }])
   })
 
@@ -255,6 +255,8 @@ describe("toHex", () => {
     expect(toHex({ r: 12, g: 34, b: 56 })).toBe("#0c2238")
     // A future host might ship 0..1 floats; rounding keeps them sane.
     expect(toHex({ r: 1, g: 0.5, b: 0 })).toBe("#ff8000")
+    // Out-of-range channel values are clamped, so the string stays a valid 6-digit colour.
+    expect(toHex({ r: 255, g: -1, b: 300 })).toBe("#ff00ff")
   })
 
   test("returns undefined for anything it cannot read", () => {

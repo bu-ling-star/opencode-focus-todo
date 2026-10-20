@@ -126,7 +126,8 @@ export interface Settings {
   /**
    * How many requests without list activity may pass before a turn start carries an
    * imperative nudge as well (optionally asking for a list that does not exist yet).
-   * 0 disables both nudges; the informative reminder is unaffected.
+   * 0 disables the maintenance nudge only: the once-per-session invitation to create a list
+   * is independent of it, and the informative reminder is unaffected.
    */
   staleAfter: number
   /** Per-item clip inside the reminder line. The tool result keeps the full text. */
@@ -140,8 +141,8 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
   reminder: true,
   reminderBudget: 360,
-  // Disabled by default: the normal reminder is enough once a plan exists, and
-  // an empty session should not be invited to create bookkeeping.
+  // Disabled by default: the normal reminder is enough once a plan exists. The
+  // once-per-session invitation is not gated on this.
   staleAfter: 0,
   itemChars: 48,
   maintenanceNudge: " — update if changed",
@@ -562,9 +563,22 @@ export function formatReminder(
     used += cost
   }
 
-  const omitted = ordered.length - parts.length
-  const line = head + parts.join(" | ") + (omitted > 0 ? ` | +${omitted} more` : "")
-  return line.length > limited ? `${line.slice(0, limited - 1)}…` : line
+  // Assemble the fullest line that fits. A hard slice at the end would be cheaper, but it
+  // can cut the `+k more` marker — the one token that tells the model the list is partial —
+  // and present a fragment as if it were the whole line. Stepping down one entry at a time
+  // degrades into a stated remainder instead, which is information rather than noise.
+  const assemble = (count: number): string => {
+    const kept = parts.slice(0, count)
+    const hidden = ordered.length - count
+    const tail = hidden > 0 ? `${kept.length > 0 ? " | " : ""}+${hidden} more` : ""
+    return `${head}${kept.join(" | ")}${tail}`
+  }
+  for (let count = parts.length; count >= 0; count -= 1) {
+    const candidate = assemble(count)
+    if (candidate.length <= limited) return candidate
+  }
+  // A budget below even the counts: state them alone, still inside the bound.
+  return `[${TOOL_NAME}] ${open.length} open`
 }
 
 /**
@@ -590,7 +604,11 @@ export function compactReminder(
   const head = `[${TOOL_NAME}] ${open.length} open${done}, unchanged: `
   const text = first.text.length > itemChars ? `${first.text.slice(0, itemChars - 1)}…` : first.text
   const line = `${head}${first.id}${MARK[first.status]} ${text}`
-  return line.length > limited ? `${line.slice(0, limited - 1)}…` : line
+  if (line.length <= limited) return line
+  // Clipping the entry would leave a fragment that reads like a truncated id or word.
+  // Keep the anchor — the counts and `unchanged` — and drop the entry instead.
+  const anchor = head.trimEnd().replace(/:$/, "")
+  return anchor.length <= limited ? anchor : `[${TOOL_NAME}] ${open.length} open`
 }
 
 /**
@@ -861,6 +879,10 @@ export function createFocusTodo(storage: Storage, log: Logger | undefined = host
     return serialize(key, async () => {
       let state: TodoState
       let notice = ""
+      // A failed read leaves us without the stored list. Writing from the empty base would
+      // silently replace whatever is really stored (the whole plan, up to 16 rows) with the
+      // result of this one call, so a mutation is refused instead of persisted.
+      let readable = true
 
       try {
         const stored = normalizeState(await storage.get(key))
@@ -870,13 +892,19 @@ export function createFocusTodo(storage: Storage, log: Logger | undefined = host
           log?.warn("[focus-todo] discarded unreadable state", { session: sessionID })
         }
       } catch (error) {
+        readable = false
         state = emptyState()
-        notice = "warn=state store unavailable, list is not persisted\n"
+        notice = "warn=state store unavailable, list not loaded\n"
         log?.warn("[focus-todo] storage read failed", { session: sessionID, error: String(error) })
       }
 
       const outcome = applyAction(state, input)
       if (!outcome.ok) return `error=${outcome.error}`
+
+      if (outcome.write && !readable) {
+        log?.warn("[focus-todo] write skipped after a failed read", { session: sessionID })
+        return `${notice}error=state store unreadable, nothing was written (the stored list is untouched)`
+      }
 
       if (outcome.write) {
         try {
@@ -1079,7 +1107,9 @@ export async function injectTail(
       id: `focus-todo-${Date.now().toString(36)}`,
       role: "user",
       content: typeof newest.content === "string" ? reminder : [{ type: "text", text: reminder }],
-      metadata: asRecord(newest.metadata) ?? {},
+      // A copy, not the same object: sharing it with the host's own message would let
+      // either side mutate the other's metadata in place.
+      metadata: { ...(asRecord(newest.metadata) ?? {}) },
     })
     storeMemo(key, {
       lastTurn: turn,

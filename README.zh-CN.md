@@ -148,8 +148,9 @@ TUI
 提醒只包含开放项，按注意力排序，并受 `reminderBudget` 限制；工具链中不追加，也不持久化。
 普通用户文本即使包含 `[focus_todo]` 也不会误触去重，去重依据是插件尾部 id 和用户消息 id。
 
-发布默认 `staleAfter: 0`：空会话不邀请建立清单，也不发送维护催更。只有显式开启后，才会在
-用户轮开始按节奏发送可选 nudge；被识别为 subagent 的会话仍会静默。
+发布默认 `staleAfter: 0`：不发送维护催更。空会话仍可能看到那条每会话一次的邀请
+（`creationNudge`），它不受 `staleAfter` 约束——否则一个从不建清单的会话永远听不到这个插件。
+显式开启维护催更后，它只在用户轮开始按节奏发送；两种形式都被识别为 subagent 的会话静默。
 
 ### 配置
 
@@ -170,10 +171,10 @@ TUI
 | --- | --- | --- |
 | `reminder` | `true` | 开启请求尾提醒；`false` 时连 session hook 都不访问。 |
 | `reminderBudget` | `360` | 生成提醒的最大字符数。 |
-| `staleAfter` | `0` | 安静 hook 调用数达到该值后才允许 nudge；`0` 关闭两种 nudge。 |
+| `staleAfter` | `0` | 安静 hook 调用数达到该值后才允许维护催更；`0` 只关闭维护催更，每会话一次的邀请不受影响。 |
 | `itemChars` | `48` | 提醒中每项的截断长度。 |
 | `maintenanceNudge` | ` — update if changed` | 开启维护 nudge 时附加的短句。 |
-| `creationNudge` | `[focus_todo] no list yet` | 开启空会话 nudge 时使用的短句。 |
+| `creationNudge` | `[focus_todo] no list yet` | 空会话那条每会话一次邀请使用的短句。 |
 
 `FOCUS_TODO_REMINDER`、`FOCUS_TODO_REMINDER_BUDGET`、`FOCUS_TODO_STALE_AFTER` 和
 `FOCUS_TODO_ITEM_CHARS` 可用环境变量覆盖文件配置。
@@ -189,12 +190,12 @@ TUI
 * 它每个请求都从 storage 重建——这正是压缩无法钝化它的原因：提醒不属于可被压缩的
   对话，无论历史发生了什么，模型在下一个请求里都会再次被提醒。
 * 无话可说时零开销：没有开放项的会话**不会**得到状态行；该行有界（每条 `itemChars`、
-  总计 `reminderBudget`）。空会话唯一可能画出的只有邀请，而且只在 `staleAfter` 节奏上。
+  总计 `reminderBudget`）。空会话唯一可能画出的只有那条每会话一次的邀请。
 
 ### 开销实测
 
 固定工具定义位于可缓存前缀；插件新增的 per-request 文本只有提醒，并受 `reminderBudget` 限制。
-默认 `staleAfter: 0` 时，空会话不增加提醒 token；有计划时每个用户轮开始最多增加一行。
+默认 `staleAfter: 0` 时，空会话不增加提醒 token（每会话一次的邀请除外）；有计划时每个用户轮开始最多增加一行。
 工具结果只在模型主动调用工具时产生开销，侧边栏是本地 UI，不进入模型上下文。
 
 需要精确 provider/token 数字时，请用 `verify/cost-report.mjs` 对真实捕获计算；不要把旧捕获中的
@@ -219,7 +220,7 @@ TUI 注册一个只读面板：
 * **存储就是 OpenCode 自己的。** 状态走官方 `context.storage` 键值域，每会话一键。
   没有插件 JSON 文件、没有数据库、没有迁移。
 * **失败从不阻塞启动。** setup 按特性逐一守卫：工具注册失败，提醒和面板完好；钩子
-  失败只损失提醒；状态读不动则带警告重置；同一会话的写操作串行化，不丢数据。
+  失败只损失提醒；状态读不动则带警告重置；读失败时拒绝写入而不是覆盖已有的清单；同一会话的写操作串行化，不丢数据。
 * **与 billion-context 共存。** 它只注册一个工具（`focus_todo`），从不触碰
   billion-context 的工具、头、提示或状态，移除 billion-context 后照常工作。共存是实测
   的，不是假设的：在录得的捕获上 **16/16** 请求携带 billion-context 的

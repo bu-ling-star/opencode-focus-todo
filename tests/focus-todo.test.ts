@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, test } from "bun:test"
 
 import focusTodoPlugin, {
   applyAction,
+  compactReminder,
   createFocusTodo,
   emptyState,
   formatReminder,
@@ -795,9 +796,38 @@ describe("createFocusTodo persistence", () => {
     }
     const run = createFocusTodo(broken, undefined).run
     const read = await run(SESSION, { action: "list" })
-    expect(read).toBe("warn=state store unavailable, list is not persisted\n0 active, done=0")
+    expect(read).toBe("warn=state store unavailable, list not loaded\n0 active, done=0")
     const write = await run(SESSION, { action: "add", text: "x" })
-    expect(write).toContain("error=state store write failed")
+    expect(write).toContain("error=state store unreadable, nothing was written")
+  })
+
+  test("a failed read never overwrites the stored list", async () => {
+    const data = new Map<string, unknown>()
+    const key = `${KEY_PREFIX}${SESSION}`
+    let down = false
+    const storage: Storage = {
+      async get(k) {
+        if (down) throw new Error("db busy")
+        return data.get(k)
+      },
+      async set(k, v) {
+        data.set(k, v)
+      },
+    }
+    const run = createFocusTodo(storage, undefined).run
+    await run(SESSION, { action: "add", text: "read the spec" })
+    await run(SESSION, { action: "add", text: "wire up storage" })
+    const before = JSON.stringify(data.get(key))
+
+    // The read fails, so the plugin holds an empty state; writing it back would replace a
+    // list it never saw with a single row.
+    down = true
+    const refused = await run(SESSION, { action: "add", text: "ghost" })
+    expect(refused).toContain("error=state store unreadable, nothing was written")
+    expect(JSON.stringify(data.get(key))).toBe(before)
+
+    down = false
+    expect(await list(run)).toContain("2 active, done=0")
   })
 
   test("concurrent mutations on one session all land", async () => {
@@ -1089,6 +1119,26 @@ describe("plugin entrypoint", () => {
 })
 
 describe("cache prefix stability", () => {
+  /**
+   * Fingerprint of the frozen tool definition the host receives (`description` + schemas):
+   * character count plus an FNV-1a digest. Pinned, because "the definition never changes" is
+   * the plugin's whole claim about the cacheable prefix, and a test that compares the module
+   * constants with themselves can never fail. Re-pin only when the change is deliberate.
+   */
+  const DEFINITION_FINGERPRINT = "1761:ac545fe6"
+
+  const fingerprint = (text: string): string => {
+    let hash = 0x811c9dc5
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index)
+      hash = Math.imul(hash, 0x01000193) >>> 0
+    }
+    return `${text.length}:${hash.toString(16).padStart(8, "0")}`
+  }
+
+  const definitionFingerprint = (tool: { description: string; input: unknown; output: unknown }): string =>
+    fingerprint(JSON.stringify({ description: tool.description, input: tool.input, output: tool.output }))
+
   const mutate: Array<FocusTodoInput | LegacyFocusTodoInput> = [
     { action: "add", text: "implement storage" },
     { action: "update", id: "t1", text: "implement storage safely" },
@@ -1098,18 +1148,25 @@ describe("cache prefix stability", () => {
     { action: "replace", items: [] },
   ]
 
-  test("tool definitions are byte-identical before and after every todo mutation", async () => {
+  test("the registered definition matches the pinned prefix baseline, before and after every mutation", async () => {
     const { context, added, data } = fakeContext()
     await focusTodoPlugin.setup(context as never)
-    const definition = () => JSON.stringify({ description: TOOL_DESCRIPTION, input: INPUT_SCHEMA, output: OUTPUT_SCHEMA })
-    const before = definition()
+    expect(added).toHaveLength(1)
+    // The object the host actually received — not the module constants it was built from.
+    const registered = added[0]!
+    expect(registered.description).toBe(TOOL_DESCRIPTION)
+    expect(registered.input).toEqual(INPUT_SCHEMA)
+    expect(registered.output).toEqual(OUTPUT_SCHEMA)
+    expect(definitionFingerprint(registered)).toBe(DEFINITION_FINGERPRINT)
+    const before = JSON.stringify(registered)
 
-    const tool = added[0] as unknown as {
+    const tool = registered as unknown as {
       execute(input: unknown, tool: { sessionID?: string }): Promise<{ output: string }>
     }
     for (const input of mutate) await tool.execute(input, { sessionID: SESSION })
 
-    expect(definition()).toBe(before)
+    expect(definitionFingerprint(registered)).toBe(DEFINITION_FINGERPRINT)
+    expect(JSON.stringify(registered)).toBe(before)
     expect(data.size).toBe(1)
     expect([...data.keys()]).toEqual([`${KEY_PREFIX}${SESSION}`])
   })
@@ -1225,6 +1282,31 @@ describe("formatReminder", () => {
     const long = formatReminder(stateWith([{ id: "t1", text: "x".repeat(MAX_TEXT), status: "pending" }]))
     expect(long!.length).toBeLessThan(120)
     expect(long!.endsWith("\u2026")).toBe(true)
+  })
+
+  test("never leaves a fragment: the +k more marker survives the tightest budget", () => {
+    const many = stateWith(
+      Array.from({ length: MAX_ITEMS }, (_, index) => ({
+        id: `t${index + 1}`,
+        text: "z".repeat(MAX_TEXT),
+        status: "pending" as const,
+      })),
+    )
+    for (const budget of [24, 40, 80, 120, 200]) {
+      const line = formatReminder(many, budget)!
+      expect(line.length).toBeLessThanOrEqual(Math.max(24, budget))
+      // Either the remainder is stated in full, or the counts stand alone — never a cut token.
+      expect(line === `[focus_todo] ${MAX_ITEMS} open` || /\+\d+ more$/.test(line)).toBe(true)
+    }
+  })
+
+  test("the compact line drops its item rather than clipping it", () => {
+    const state = stateWith([{ id: "t1", text: "y".repeat(MAX_TEXT), status: "in_progress" }])
+    const wide = compactReminder(state, 360)!
+    expect(wide.startsWith("[focus_todo] 1 open, unchanged: t1> ")).toBe(true)
+    const tight = compactReminder(state, 40)!
+    expect(tight.length).toBeLessThanOrEqual(40)
+    expect(tight).toBe("[focus_todo] 1 open, unchanged")
   })
 
   test("never exceeds the budget, whatever it is set to", () => {

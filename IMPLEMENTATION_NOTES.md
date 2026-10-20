@@ -1433,6 +1433,57 @@ is what you want for a cold model. And a list that changes on every turn (the he
 still pays the full line every turn; the delta only helps the *stuck* case, which is exactly
 the case where the model has stopped paying attention.
 
+### §9.23 — Hardening pass after an external review (2026-10-14)
+
+A full self-review of the workspace (no probe run, no wire capture) found three defects worth
+fixing and three cosmetic ones. All are fixed in one pass; 196 unit tests pass (4 files),
+`tsc --noEmit` clean.
+
+1. **A failed read could overwrite the stored list.** `handle()` caught a `storage.get`
+   failure, degraded to `emptyState()` and then happily wrote the result of the mutation on top
+   of a key it had just failed to read — one `add` would replace a 16-row plan with one row.
+   The catch now sets `readable = false`, and a mutation in that state returns
+   `error=state store unreadable, nothing was written (the stored list is untouched)` without
+   touching `storage.set`. Reads still degrade to the warning + empty list, which is correct:
+   showing nothing beats showing a lie. Regression test seeds two rows, fails the read, asserts
+   the stored JSON is byte-identical afterwards and that the list returns intact once the store
+   recovers. The warning text changed (`list not loaded`, was `list is not persisted`) because
+   the old wording described the *new* bug as if it were intended behaviour.
+2. **The cache-prefix test could not fail.** It compared `JSON.stringify({TOOL_DESCRIPTION,
+   INPUT_SCHEMA, OUTPUT_SCHEMA})` with itself — a tautology that stayed green even if every
+   string in it changed. It now reads the object the *host* actually received (`added[0]`) and
+   compares its fingerprint (`length:fnv1a`, pinned at `1761:ac545fe6`) before and after every
+   mutation, plus `description`/`input`/`output` identity against the exported constants. An
+   accidental edit to the description or schema now fails a test instead of silently rotting the
+   cacheable prefix; the second, independent test (definition unchanged across mutations, read
+   from the registration) stays.
+3. **The reminder could cut its own `+k more` marker off.** `formatReminder` built the line
+   greedily and then did `line.slice(0, limited - 1) + "…"`, which for a budget too small for
+   even the first entry produced a mid-token fragment that presented a partial list as if it
+   were the whole one — and dropped the marker that says otherwise. It now assembles the
+   fullest line that fits by stepping down one entry at a time, each step stating the remainder
+   in full (`[focus_todo] 16 open: +16 more`), and falls back to the bare counts
+   (`[focus_todo] 16 open`) only when even that does not fit. `compactReminder` drops its single
+   entry and keeps the anchor (`[focus_todo] 1 open, unchanged`) rather than clipping an id.
+
+Smaller ones: `toHex` clamps channels and pads to two digits instead of emitting a short one
+(`(8).toString(16)` is `"8"`, so a dim colour came out as a 5-character hex); `remember`
+evicts the oldest session
+instead of `clear()`-ing all 64 when one more arrives, which used to blank the panel back to
+`暂无待办` in every other session; `setup()` wraps `context.ui.slot()` in `try/catch` like every
+step of the server half, so a host-side change costs the panel rather than the TUI plugin load;
+and assistant-message `metadata` is copied, not shared, so neither side can mutate the other's.
+
+**Docs corrected**: both READMEs claimed `staleAfter: 0` disables *both* nudge forms. It does
+not — the once-per-session invitation to create a list is independent of it (§9.22), which is
+what the code has done since the shell round. Settings table, the `staleAfter` doc comment and
+`DEFAULT_SETTINGS` are now accurate about which form is opt-in.
+
+Deliberately **not** changed: the `…` clip of a single over-long item inside `itemChars` (that
+is the configured behaviour and it is bounded); `stateSignature` (it reads nothing else —
+harmless over-invalidation, not a bug); and the Unicode/ZWJ character count in `clip()`
+(correct for terminals, wrong only for emoji; the fallback is a render artefact, not state).
+
 
 ## 10. Known limitations
 

@@ -207,17 +207,24 @@ export function toHex(raw: unknown): string | undefined {
     const octets = view as { readonly length?: number }
     const first = (view as readonly unknown[])[0]
     if (typeof octets.length === "number" && octets.length >= 3 && typeof first === "number") {
-      const [r, g, b] = view as readonly number[]
-      return `#${[r, g, b].map((value) => (value as number).toString(16).padStart(2, "0")).join("")}`
+      // The length was just checked, so the tuple shape is a fact, not a guess.
+      const [r, g, b] = view as readonly [number, number, number]
+      return `#${[r, g, b].map(hexByte).join("")}`
     }
   }
   const rgb = raw as { r?: unknown; g?: unknown; b?: unknown }
   if (typeof rgb.r === "number" && typeof rgb.g === "number" && typeof rgb.b === "number") {
     // Any channel above 1 marks the triple as 0..255; otherwise treat it as 0..1 floats.
-    const scale = rgb.r > 1 || rgb.g > 1 || rgb.b > 1 ? 1 : 255
-    return `#${[rgb.r, rgb.g, rgb.b].map((value) => Math.max(0, Math.min(255, Math.round((value as number) * scale))).toString(16).padStart(2, "0")).join("")}`
+    const { r, g, b } = rgb as { r: number; g: number; b: number }
+    const scale = r > 1 || g > 1 || b > 1 ? 1 : 255
+    return `#${[r, g, b].map((value) => hexByte(value * scale)).join("")}`
   }
   return undefined
+}
+
+/** One colour channel as two hex digits; out-of-range input is clamped, not emitted raw. */
+function hexByte(value: number): string {
+  return Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, "0")
 }
 
 /**
