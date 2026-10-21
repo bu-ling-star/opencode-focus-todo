@@ -8,35 +8,60 @@
 
 import { describe, expect, test } from "bun:test"
 
-import { applyAction, emptyState, formatReminder, formatState, MAX_DONE, MAX_ITEMS, type TodoState } from "../src/focus-todo/server.ts"
-import { MAX_DONE_ROWS, MAX_OPEN_ROWS, MAX_ROW_WIDTH, MAX_ROWS, MESSAGE_SCAN_LIMIT, TOOL_NAME, buildPanel, charWidth, clip, displayWidth, extractFocusState, isFoldStorePair, latestFocusState, parseFocusState, type FocusView, toHex } from "../src/focus-todo/view.ts"
+import { applyAction, emptyState, formatState, type TodoState } from "../src/focus-todo/server.ts"
+import {
+  MAX_PARSE_ROWS,
+  MAX_ROW_WIDTH,
+  MESSAGE_SCAN_LIMIT,
+  TOOL_NAME,
+  buildPanel,
+  charWidth,
+  chooseFocusView,
+  clip,
+  displayWidth,
+  elapsedLabel,
+  extractFocusState,
+  isFocusSnapshot,
+  isFocusView,
+  isFoldStorePair,
+  latestFocusHit,
+  latestFocusState,
+  parseFocusState,
+  viewFromMeta,
+  viewSignature,
+  type FocusView,
+  toHex,
+} from "../src/focus-todo/view.ts"
 
 const SESSION = "ses_view0000aaaaaaaaaaaaaaaaaaaaa"
 
-describe("cap agreement with the tool", () => {
-  test("the panel's row budget is the tool's own caps, not a guess", () => {
-    // view.ts cannot import server.ts at runtime (the panel stays standalone), so the
-    // literals are duplicated by design — and this is what keeps them in sync.
-    expect(MAX_OPEN_ROWS).toBe(MAX_ITEMS)
-    expect(MAX_DONE_ROWS).toBe(MAX_DONE)
-    expect(MAX_ROWS).toBe(MAX_ITEMS + MAX_DONE)
-  })
-
-  test("a real list at both caps is still parsed and rendered whole", () => {
-    const state: TodoState = { version: 1, revision: 0, completed: MAX_DONE, nextId: 0, items: [] }
-    for (let index = 1; index <= MAX_ITEMS + MAX_DONE; index += 1) {
+describe("panel caps", () => {
+  test("accepts a list larger than the shipped defaults", () => {
+    // `maxItems` / `maxDone` are configurable, so the panel must not mirror the
+    // defaults and reject a legitimate dump; only the safety ceiling applies.
+    const state: TodoState = { version: 1, revision: 0, completed: 20, nextId: 0, items: [] }
+    for (let index = 1; index <= 23; index += 1) {
       state.items.push({
         id: `t${index}`,
         text: `item ${index}`,
         status: "pending",
-        ...(index > MAX_ITEMS ? { done: true } : {}),
+        ...(index > 20 ? { done: true } : {}),
       })
     }
     const parsed = parseFocusState(formatState(state))
-    expect(parsed?.active).toBe(MAX_ITEMS)
-    expect(parsed?.done).toBe(MAX_DONE)
-    expect(parsed?.items).toHaveLength(MAX_ROWS)
-    expect(buildPanel(parsed).rows).toHaveLength(MAX_ROWS)
+    expect(parsed?.active).toBe(20)
+    expect(parsed?.done).toBe(20)
+    // 20 open rows plus the newest marked row; the rest is `+N done`.
+    expect(parsed?.items).toHaveLength(21)
+    const panel = buildPanel(parsed)
+    expect(panel.openRows).toHaveLength(20)
+    expect(panel.doneRows).toHaveLength(1)
+  })
+
+  test("rejects a body past the safety ceiling", () => {
+    const tooMany = [`${MAX_PARSE_ROWS + 1} active, done=0`]
+    for (let index = 1; index <= MAX_PARSE_ROWS + 1; index += 1) tooMany.push(`t${index}:> item ${index}`)
+    expect(parseFocusState(tooMany.join("\n"))).toBeUndefined()
   })
 })
 
@@ -114,10 +139,11 @@ describe("parseFocusState", () => {
     expect(parseFocusState("1 active, done=0\ntoolongidentifier1234:> nope")).toBeUndefined()
   })
 
-  test("rejects more rows than the tool can ever hold", () => {
-    const tooMany = ["9 active, done=0"]
-    for (let index = 1; index <= MAX_ITEMS + 1; index += 1) tooMany.push(`t${index}:> item ${index}`)
-    expect(parseFocusState(tooMany.join("\n"))).toBeUndefined()
+  test("ignores the collapsed done summary row", () => {
+    const parsed = parseFocusState("2 active, done=9\nt1:> still open\nt2:- next\nt8:x finished\n+5 done")
+    expect(parsed?.active).toBe(2)
+    expect(parsed?.done).toBe(9)
+    expect(parsed?.items.map((item) => item.id)).toEqual(["t1", "t2", "t8"])
   })
 
   test("reads marked rows, keeps them out of the active count and keeps them in the list", () => {
@@ -216,6 +242,140 @@ describe("latestFocusState", () => {
   })
 })
 
+describe("structured metadata", () => {
+  const payload = {
+    version: 1,
+    revision: 7,
+    active: 2,
+    completed: 5,
+    items: [
+      { id: "t1", text: "implement storage", status: "in_progress", done: false, startedAt: 1_700_000_000_000 },
+      { id: "t2", text: "add tests", status: "pending", done: false },
+      { id: "t3", text: "ship", status: "pending", done: true },
+    ],
+  }
+
+  /** The host wraps plugin metadata once more: `state.metadata.metadata.focus`. */
+  function partWith(meta: unknown, text = "garbage the text parser must not be reached for") {
+    return {
+      type: "tool",
+      id: "call_1",
+      name: TOOL_NAME,
+      state: { status: "completed", content: [{ type: "text", text }], metadata: { metadata: { focus: meta } } },
+    }
+  }
+
+  test("reads the wrapped path the host persists, without touching the text", () => {
+    const view = extractFocusState(partWith(payload))
+    expect(view?.active).toBe(2)
+    expect(view?.done).toBe(5)
+    expect(view?.revision).toBe(7)
+    expect(view?.items).toEqual([
+      { id: "t1", text: "implement storage", status: "in_progress", startedAt: 1_700_000_000_000 },
+      { id: "t2", text: "add tests", status: "pending" },
+      { id: "t3", text: "ship", status: "done" },
+    ])
+  })
+
+  test("accepts the unwrapped path too", () => {
+    const flat = partWith(undefined)
+    flat.state.metadata = { focus: payload } as never
+    expect(extractFocusState(flat)?.revision).toBe(7)
+  })
+
+  test("falls back to the text dump when the payload is inconsistent", () => {
+    // `completed` below the marked rows cannot have come from the tool, so the
+    // structured path refuses it and the text result is still readable.
+    const broken = { ...payload, completed: 0 }
+    const part = partWith(broken, "1 active, done=1\nt1:> keep going")
+    expect(extractFocusState(part)?.items).toEqual([{ id: "t1", status: "in_progress", text: "keep going" }])
+  })
+
+  test("rejects an unknown version and malformed rows", () => {
+    expect(viewFromMeta({ ...payload, version: 2 })).toBeUndefined()
+    expect(viewFromMeta({ ...payload, items: [{ id: "t1", text: "x", status: "running", done: false }] })).toBeUndefined()
+    expect(viewFromMeta({ ...payload, items: [{ id: "t1", text: "x", status: "pending", done: false, startedAt: -1 }] })).toBeUndefined()
+    expect(viewFromMeta({ ...payload, items: [{ id: "t1", text: "x", status: "pending" }] })).toBeUndefined()
+    expect(viewFromMeta(undefined)).toBeUndefined()
+  })
+
+  test("a hit carries the host timestamp and message id for snapshot ordering", () => {
+    const message = {
+      id: "msg_9",
+      type: "assistant",
+      time: { completed: 1_700_000_123_000 },
+      content: [partWith(payload)],
+    }
+    const hit = latestFocusHit([message])
+    expect(hit?.messageID).toBe("msg_9")
+    expect(hit?.at).toBe(1_700_000_123_000)
+    // The text-only projection remains the same view.
+    expect(latestFocusState([message])?.revision).toBe(7)
+  })
+})
+
+describe("view timing", () => {
+  const running = {
+    active: 1,
+    done: 0,
+    items: [{ id: "t1", status: "in_progress" as const, text: "fix parser", startedAt: 1_000_000 }],
+  }
+
+  test("prefixes a running row with its age once a minute has passed", () => {
+    expect(buildPanel(running, 96, 1_000_000 + 12 * 60_000).rows[0]?.line).toBe("▶ t1 12m fix parser")
+    expect(buildPanel(running, 96, 1_000_000 + 65 * 60_000).rows[0]?.line).toBe("▶ t1 1h05m fix parser")
+  })
+
+  test("stays quiet for a fresh row and for rows that are not running", () => {
+    expect(buildPanel(running, 96, 1_000_000 + 30_000).rows[0]?.line).toBe("▶ t1 fix parser")
+    const pending = { ...running, items: [{ ...running.items[0]!, status: "pending" as const }] }
+    expect(buildPanel(pending, 96, 1_000_000 + 12 * 60_000).rows[0]?.line).toBe("○ t1 fix parser")
+    expect(elapsedLabel(running.items[0]!, undefined)).toBe("")
+  })
+})
+
+describe("snapshot choice", () => {
+  const view = (revision: number | undefined, done = 0): FocusView => ({
+    active: 1,
+    done,
+    items: [{ id: "t1", status: "pending", text: "work" }],
+    ...(revision !== undefined ? { revision } : {}),
+  })
+
+  test("revision decides when both sides have one", () => {
+    expect(chooseFocusView({ view: view(8, 2), at: 100 }, { view: view(7, 1), at: 200 })).toEqual(view(8, 2))
+    expect(chooseFocusView({ view: view(6, 2), at: 300 }, { view: view(7, 1), at: 200 })).toEqual(view(7, 1))
+  })
+
+  test("the host timestamp decides when revision is unavailable", () => {
+    expect(chooseFocusView({ view: view(undefined, 2), at: 300 }, { view: view(undefined, 1), at: 200 })).toEqual(
+      view(undefined, 2),
+    )
+    expect(chooseFocusView({ view: view(undefined, 2), at: 100 }, { view: view(undefined, 1), at: 200 })).toEqual(
+      view(undefined, 1),
+    )
+  })
+
+  test("an untimed fresh result beats the cache, and a missing side yields the other", () => {
+    expect(chooseFocusView({ view: view(undefined, 2) }, { view: view(undefined, 1), at: 200 })).toEqual(
+      view(undefined, 2),
+    )
+    expect(chooseFocusView(undefined, { view: view(9), at: 1 })).toEqual(view(9))
+    expect(chooseFocusView({ view: view(9) }, undefined)).toEqual(view(9))
+    expect(chooseFocusView(undefined, undefined)).toBeUndefined()
+  })
+
+  test("validates what is read back, and its signature ignores the clock", () => {
+    expect(isFocusView(view(1))).toBe(true)
+    expect(isFocusSnapshot({ view: view(1), at: 5 })).toBe(true)
+    expect(isFocusSnapshot({ view: { active: 2, done: 0, items: [] } })).toBe(false)
+    expect(isFocusSnapshot({ view: view(1), at: -5 })).toBe(false)
+    expect(isFocusSnapshot("nope")).toBe(false)
+    expect(viewSignature(view(3, 1))).toBe(viewSignature(view(3, 1)))
+    expect(viewSignature(view(3, 1))).not.toBe(viewSignature(view(4, 1)))
+  })
+})
+
 describe("width handling", () => {
   test("counts wide characters as two columns", () => {
     expect(charWidth("a")).toBe(1)
@@ -281,11 +441,25 @@ describe("buildPanel", () => {
   })
 
   test("says 暂无待办 until the session has used the tool", () => {
-    expect(buildPanel(undefined)).toEqual({ header: "暂无待办", rows: [] })
+    expect(buildPanel(undefined)).toEqual({
+      header: "暂无待办",
+      rows: [],
+      openRows: [],
+      doneRows: [],
+      active: 0,
+      done: 0,
+    })
   })
 
   test("says 暂无待办 for a list that was cleared before anything finished", () => {
-    expect(buildPanel(view(0, 0))).toEqual({ header: "暂无待办", rows: [] })
+    expect(buildPanel(view(0, 0))).toEqual({
+      header: "暂无待办",
+      rows: [],
+      openRows: [],
+      doneRows: [],
+      active: 0,
+      done: 0,
+    })
   })
 
   test("shows all done plus the marked rows once nothing is open", () => {
@@ -308,6 +482,10 @@ describe("buildPanel", () => {
     expect(buildPanel({ active: 0, done: 1, items: [] })).toEqual({
       header: "Focus 0 active, done 1",
       rows: [],
+      openRows: [],
+      doneRows: [],
+      active: 0,
+      done: 1,
     })
 
     expect(buildPanel({ active: 0, done: 12, items: [] }, 30).header).toBe("Focus 0 active, done 12")
@@ -357,9 +535,13 @@ describe("buildPanel", () => {
     expect(displayWidth(buildPanel(long)?.rows[0]?.line ?? "")).toBeLessThanOrEqual(MAX_ROW_WIDTH)
   })
 
-  test("never emits more rows than the tool can hold", () => {
-    const many = { active: MAX_ITEMS, done: 0, items: view(MAX_ITEMS, 0).items }
-    expect(buildPanel(many)?.rows).toHaveLength(MAX_ITEMS)
+  test("never emits more rows than the safety ceiling", () => {
+    const items = Array.from({ length: MAX_PARSE_ROWS }, (_unused, index) => ({
+      id: `t${index + 1}`,
+      status: "pending" as const,
+      text: `item ${index + 1}`,
+    }))
+    expect(buildPanel({ active: MAX_PARSE_ROWS, done: 0, items })?.rows).toHaveLength(MAX_PARSE_ROWS)
   })
 })
 

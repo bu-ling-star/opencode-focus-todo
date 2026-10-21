@@ -262,6 +262,14 @@ The two halves do **not** share storage, and this was measured, not assumed:
   `<state>/<channel>/tui/<key>.json` files with a `fs.watch` live-reload, and key segments
   may not contain `/`.
 
+Session deletion removes the server-side row: `setup` subscribes to the host event stream
+(`event.subscribe`, with `event.listen` accepted as the same domain under an older name) and
+calls `storage.remove` for `focus-todo/session/<id>` when a `session.deleted` event arrives.
+The binary declares `data.sessionID`; some envelopes wrap it as `{details:{type,data}}` and a
+few builds use `data.info.id`, so both shapes are accepted. A deletion that happens while no
+plugin process is running leaves an inert row behind; there is no startup sweep, because the
+behaviour of `session.get` for a missing id has not been verified.
+
 So the TUI cannot read `focus-todo/session/<sessionID>`, and a file-based project plugin
 gets neither an event-bus publisher nor an RPC surface. The remaining option is the one
 taken: the panel reads the newest `focus_todo` tool result **already in the current
@@ -399,23 +407,24 @@ reset counter. The entrypoint suite is hermetic: it points `XDG_CONFIG_HOME` at 
 path that does not exist, so a real config file on the machine cannot change what the tests
 observe.
 
-`tests/focus-todo-view.test.ts` (36) round-trips the server's own `formatState` output through
-the panel's parser (so the two halves cannot drift), and covers `warn=` prefixes, `error=`
-text, malformed bodies, more than 16 items, a body longer than the tool's own caps (16 open
-plus 16 marked), `x` rows and an oversized `done=`, derived counts, scan limits, junk inputs,
-wide-character width budgets, every `buildPanel` branch — including both `暂无待办` branches,
-`all done` with marked rows, and the count-only line when the marks were removed (§9.20) —
-`reminderStatus` for the three provable cases, `newestIsOwnResult` looking only at the newest
-message, and the cap agreement with the tool (the panel's row budget is asserted equal to
-`MAX_ITEMS`/`MAX_DONE`, so the duplicated literals cannot drift).
+`tests/focus-todo-view.test.ts` round-trips the server's own `formatState` output through the
+panel's parser (so the two halves cannot drift), and covers `warn=` prefixes, `error=`
+text, malformed bodies, a body past the parser's safety ceiling, `+N done` summary rows,
+`x` rows and an oversized `done=`, derived counts, scan limits, junk inputs, wide-character
+width budgets, every `buildPanel` branch — including both `暂无待办` branches, `all done`
+with marked rows, and the count-only line when the marks were removed (§9.20) — the
+structured `metadata.focus` path (wrapped and flat, plus fallback when it is inconsistent),
+snapshot choice by revision/timestamp, row age, and `isFoldStorePair`.
 
-`tests/tui-panel.test.ts` (15) loads the real `tui.tsx` through a stubbed JSX runtime and
+`tests/tui-panel.test.ts` loads the real `tui.tsx` through a stubbed JSX runtime and
 asserts that one plugin directory resolves **both** entrypoints, that all three plugin files
 resolve from inside that one directory (so a directory copy is a complete install), that
-exactly one slot is claimed and it is `append: "sidebar.content"`, that cleanup releases it,
+exactly one slot is claimed and it is `after: "sidebar.content"`, that cleanup releases it,
 that a non-TUI context leaves the panel inert, and that rendering matches the session state
-(header, status line, rows — both `0 active, done=N` shapes, §9.20), colours each status, clips
-to the terminal budget and isolates sessions.
+(header, rows — both `0 active, done=N` shapes, §9.20), prefers structured metadata over the
+text dump, restores a persisted snapshot after a restart, writes a newer revision over the
+cache, folds the done section independently, colours each status, clips to the sidebar budget
+and isolates sessions.
 
 `tests/focus-todo-invariants.test.ts` (10) is the hunt described in §9.17.1: seeded random
 action sequences (including deliberately invalid ones) checked against the state invariants
@@ -1007,11 +1016,11 @@ plan that produced it except the id sequence. Verified on the wire
 completion (`0 active, done=3` with the two marked rows), and are gone after the next plan
 (`verify/wire-counter.jsonl`, §9.18, where the counter reads `done=0` again).
 
-Row text of a marked item is clipped to `DONE_TEXT_MAX` = 24 characters in the tool result
+Row text of a marked item is clipped to `DONE_TEXT_MAX` = 32 characters in the tool result
 (`t1:x implement storage`, `t3:x long description of someth…`). Marked rows accumulate in every
 tool result, so they are the one place where the new behaviour costs bytes; the cap is what
-keeps it bounded — at most 16 marked rows × ≤32 characters ≈ 500 bytes, and only inside a
-result the model asked for, never on a plain request.
+keeps it bounded — at most `MAX_DONE` (10) marked rows × ≤32 characters ≈ 320 characters, and
+only inside a result the model asked for, never on a plain request.
 
 **Why the two channels differ.** The reminder exists to tell the model *what is left*; the
 sidebar exists to tell a human *what happened*. Marked rows are therefore in the tool result
@@ -1042,7 +1051,7 @@ tool uses, and after **every** step asserts the invariants a bug would break:
 
 | Invariant | Why it matters |
 | --- | --- |
-| ≤16 open, ≤16 marked, ≤32 rows total | the caps are the whole anti-bloat story |
+| ≤`maxItems` open, ≤`maxDone` marked | the caps are the whole anti-bloat story (defaults 16/10, configurable to 64/50) |
 | ≤1 open `in_progress`, and marked rows never hold the slot | the rule the model is told about |
 | ids unique, well-formed, never reused (`nextId` ahead) | an id collision corrupts both the panel and the model's view |
 | stored order == printed order (open first, marked last, newest finish first) | this is the invariant the first defect violated |
@@ -1198,7 +1207,7 @@ table from any capture):
 | System prompt | 17 770 chars / 18 151 bytes, byte-identical | untouched by the plugin |
 | Request-tail reminder | 7 of 16 requests carried one; largest 123 chars ≈ 31 tokens | `reminderBudget` 360 chars ≈ 90 tokens |
 | Tool results | largest 195 chars ≈ 49 tokens | 16 open × 150 chars ≈ 2.7 KB when the model asks |
-| Marked rows in results | ≤ 16 × 32 chars ≈ 128 chars | `MAX_DONE` × `DONE_TEXT_MAX` |
+| Marked rows in results | ≤ 10 × 32 chars ≈ 320 chars | `MAX_DONE` × `DONE_TEXT_MAX` |
 | Session state / panel | ≈ 3 KB per session in one storage key / 0 bytes to the model | both fixed |
 
 **Harness notes, because they cost several attempts** (all in `_evidence/wire/frame.sh` now):
@@ -1612,8 +1621,10 @@ same instrumentation):
   claim moves `prepend` → `append` to match every built-in panel.
 - `storage.store(key, {initial})` is the host's UI-preference persistence — the built-in
   getting-started panel persists its dismiss flag through exactly this call, returning a
-  `[state, setState]` pair whose state object is reactive. The fold flag rides here under
-  `focus-todo.panel`; todo state never touches it.
+  `[state, setState]` pair whose state object is reactive. Two UI-only keys ride here:
+  `focus-todo.panel` (fold flags) and `focus-todo.snapshot` (a bounded per-session copy of the
+  last view, so a restart or the 20-message window cannot blank the panel while the list is
+  still in server storage). Todo state never touches it and the server half never reads it.
 - Probe hygiene learned the hard way: fire-and-forget `Bun.write` appends from the TUI
   process **lose lines on Windows** (concurrent opens → `EPERM` sharing violation, logged as
   unhandled rejections while looking like "code never ran"). The synchronous

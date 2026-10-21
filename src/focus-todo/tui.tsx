@@ -11,20 +11,39 @@
  * project-local TUI plugin possible at all, with no configuration, no package
  * install and no declared dependency.
  *
- * It only reads: the newest `focus_todo` tool result in the current session's
- * message window, projected by the pure helpers in `./view.ts`. Nothing is
- * written, injected into a model request, or stored — with one deliberate
- * exception: the panel's *folded* flag persists through the host's own
- * `storage.store`, the same UI-preferences channel the built-in "getting
- * started" panel uses for its dismiss state. Todo state never touches it.
+ * The panel reads the newest `focus_todo` result in the current session's message
+ * window: the structured `metadata.focus` first, the text dump as a fallback. It
+ * resolves that through the pure helpers in `./view.ts`. Nothing is injected into
+ * a model request and no todo state is owned here. It does persist two UI-only
+ * things through the host's own `storage.store` (the channel the built-in
+ * "getting started" panel uses for its dismiss state):
+ *
+ *  - the folded flags, so the panel reopens the way the user left it;
+ *  - a bounded per-session copy of the last view, so a restart (or the result
+ *    scrolling out of the host's 20-message window) does not blank the panel to
+ *    `暂无待办` while the list is still in storage.
+ *
+ * The cache is a projection, never a source of truth: a fresh tool result always
+ * replaces it, and nothing is ever read back by the server half.
  *
  * The `id` matches the server half on purpose (same convention as the installed
  * `opencode-visual-cache`): the two halves are separate registries and only the
  * server half owns state.
  */
 import { For, Show, createMemo, createSignal } from "solid-js"
-import { MAX_ROW_WIDTH, buildPanel, clip, isFoldStorePair, latestFocusState, toHex } from "./view.ts"
-import type { FocusView, PanelRow, ViewStatus } from "./view.ts"
+import {
+  MAX_ROW_WIDTH,
+  SNAPSHOT_SESSIONS,
+  buildPanel,
+  chooseFocusView,
+  clip,
+  isFocusSnapshot,
+  isFoldStorePair,
+  latestFocusHit,
+  toHex,
+  viewSignature,
+} from "./view.ts"
+import type { FocusSnapshot, PanelRow, ViewStatus } from "./view.ts"
 
 /**
  * Minimal hand-written view of the parts of the v2 TUI plugin API this file
@@ -68,9 +87,9 @@ interface TuiContext {
   /**
    * Host persistence for UI preferences. `store(key, { initial })` returns a
    * `[state, setState]` pair backed by the host's own storage; the state object
-   * is reactive. Only the panel's fold flag lives here — probing on the shipped
-   * build confirmed the shape (`storage.store` is a function, and the built-in
-   * getting-started panel persists its dismissed flag through exactly this call).
+   * is reactive and live-syncs across instances. Both the fold flags and the
+   * session snapshot live here. There is no `get` on this side — that is why the
+   * TUI keeps its own bounded mirror instead of reading the server's storage.
    */
   readonly storage?: {
     readonly store?: (key: string, options: { initial: unknown }) => unknown
@@ -103,25 +122,22 @@ const MIN_ROW_WIDTH = 14
 const SIDEBAR_ROW_WIDTH = 37
 
 /**
- * The newest `focus_todo` result can leave the window the TUI holds (the host keeps the
- * last 20 messages by default), which used to blank the panel to `暂无待办` while a list
- * was plainly in use. Remembering the last parsed state per session keeps the panel
- * honest; the map is memory only and bounded, and a cleared list still refreshes it
- * because a cleared result parses as a normal `0 active, done=0` dump.
+ * Memory mirror of the persisted snapshots. It serves two purposes: the obvious
+ * in-process cache for a session whose result has left the window, and the
+ * fallback when the host does not hand back the documented `storage.store` pair
+ * (a UI preference is allowed to degrade to "resets on restart").
  */
 const MEMORY_LIMIT = 64
-const remembered = new Map<string, FocusView>()
+const remembered = new Map<string, FocusSnapshot>()
 
-function remember(sessionID: string, view: FocusView | undefined): FocusView | undefined {
-  if (view === undefined) return remembered.get(sessionID)
+function rememberSnapshot(sessionID: string, snapshot: FocusSnapshot): void {
   if (remembered.size >= MEMORY_LIMIT && !remembered.has(sessionID)) {
     // Evict the least recently added entry, not the whole map: clearing everything made the
     // panel drop back to `暂无待办` in every other session as soon as the limit was reached.
     const oldest = remembered.keys().next().value
     if (oldest !== undefined) remembered.delete(oldest)
   }
-  remembered.set(sessionID, view)
-  return view
+  remembered.set(sessionID, snapshot)
 }
 
 /** Test seam: forget every remembered panel state. */
@@ -129,31 +145,46 @@ export function forgetPanelState(): void {
   remembered.clear()
 }
 
-/** Where the folded flag persists. One key, one boolean, nothing else. */
+/** Where the folded flags persist. One key, two booleans, nothing else. */
 const FOLD_KEY = "focus-todo.panel"
+/** Where the bounded per-session view cache persists. */
+const SNAPSHOT_KEY = "focus-todo.snapshot"
+
+interface FoldState {
+  open?: boolean
+  doneOpen?: boolean
+}
 
 interface Fold {
-  /** Reactive read of whether the body is expanded. */
+  /** Reactive read of whether the whole panel body is expanded. */
   open(): boolean
-  /** Flip the flag and persist it; failures are cosmetic by construction. */
+  /** Reactive read of whether the done section is expanded. */
+  doneOpen(): boolean
+  /** Flip the panel flag and persist it; failures are cosmetic by construction. */
   toggle(): void
+  /** Flip only the done section. */
+  toggleDone(): void
+  /** True when the host handed back its `[state, setState]` pair. */
+  readonly persistent: boolean
 }
 
 /**
- * Fold state from the host's `storage.store`, falling back to an in-memory
- * signal when the host does not hand back the documented `[state, setState]`
- * pair. Both paths are reactive; only persistence differs.
+ * Fold state from the host's `storage.store`, falling back to in-memory signals
+ * when the host does not hand back the documented pair. Both paths are reactive;
+ * only persistence differs. The done section starts collapsed, because the open
+ * work is what the panel is for.
  */
 function createFold(context: TuiContext): Fold {
   try {
     const store = context.storage?.store
     if (typeof store === "function") {
-      const pair = store.call(context.storage, FOLD_KEY, { initial: { open: true } })
+      const pair = store.call(context.storage, FOLD_KEY, { initial: { open: true, doneOpen: false } })
       if (isFoldStorePair(pair)) {
-        const state = pair[0] as { open?: boolean }
-        const setState = pair[1] as (updater: (draft: { open: boolean }) => void) => void
+        const state = pair[0] as FoldState
+        const setState = pair[1] as (updater: (draft: FoldState) => void) => void
         return {
           open: () => state.open !== false,
+          doneOpen: () => state.doneOpen === true,
           toggle: () => {
             try {
               const next = state.open !== false
@@ -164,6 +195,17 @@ function createFold(context: TuiContext): Fold {
               /* a lost fold flip is cosmetic; the panel keeps rendering */
             }
           },
+          toggleDone: () => {
+            try {
+              const next = state.doneOpen === true
+              setState((draft) => {
+                draft.doneOpen = !next
+              })
+            } catch {
+              /* a lost fold flip is cosmetic; the panel keeps rendering */
+            }
+          },
+          persistent: true,
         }
       }
     }
@@ -171,7 +213,88 @@ function createFold(context: TuiContext): Fold {
     /* fall through to the memory-only fold */
   }
   const [open, setOpen] = createSignal(true)
-  return { open, toggle: () => setOpen((value) => !value) }
+  const [doneOpen, setDoneOpen] = createSignal(false)
+  return {
+    open,
+    doneOpen,
+    toggle: () => setOpen((value) => !value),
+    toggleDone: () => setDoneOpen((value) => !value),
+    persistent: false,
+  }
+}
+
+interface SessionsSnapshot {
+  sessions?: Record<string, unknown>
+}
+
+interface SnapshotStore {
+  /** Reactive read (inside a memo) of the last view for this session. */
+  read(sessionID: string): FocusSnapshot | undefined
+  /** Remember a view; written only when its signature actually changed. */
+  write(sessionID: string, snapshot: FocusSnapshot): void
+  readonly persistent: boolean
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function entryOf(value: unknown): FocusSnapshot | undefined {
+  if (!isRecord(value)) return undefined
+  return isFocusSnapshot(value) ? value : undefined
+}
+
+/**
+ * Bounded per-session view cache. The host's message window keeps the last 20
+ * messages, so the very result the panel projects can scroll out mid-plan; the
+ * cache is the only way the panel survives both that and a restart (the TUI half
+ * has no `storage.get`, so it cannot read the server's authoritative state).
+ */
+function createSnapshot(context: TuiContext): SnapshotStore {
+  try {
+    const store = context.storage?.store
+    if (typeof store === "function") {
+      const pair = store.call(context.storage, SNAPSHOT_KEY, { initial: { sessions: {} } })
+      if (isFoldStorePair(pair)) {
+        const state = pair[0] as SessionsSnapshot
+        const setState = pair[1] as (updater: (draft: SessionsSnapshot) => void) => void
+        return {
+          read(sessionID: string): FocusSnapshot | undefined {
+            const sessions = isRecord(state.sessions) ? state.sessions : undefined
+            return entryOf(sessions?.[sessionID]) ?? remembered.get(sessionID)
+          },
+          write(sessionID: string, snapshot: FocusSnapshot): void {
+            rememberSnapshot(sessionID, snapshot)
+            const sessions = isRecord(state.sessions) ? state.sessions : undefined
+            const previous = entryOf(sessions?.[sessionID])
+            if (previous !== undefined && viewSignature(previous.view) === viewSignature(snapshot.view)) return
+            try {
+              setState((draft) => {
+                const next: Record<string, unknown> = { ...(isRecord(draft.sessions) ? draft.sessions : {}) }
+                next[sessionID] = snapshot
+                const ids = Object.keys(next)
+                if (ids.length > SNAPSHOT_SESSIONS) {
+                  ids.sort((a, b) => (entryOf(next[a])?.at ?? 0) - (entryOf(next[b])?.at ?? 0))
+                  for (const id of ids.slice(0, ids.length - SNAPSHOT_SESSIONS)) delete next[id]
+                }
+                draft.sessions = next
+              })
+            } catch {
+              /* a lost cache write costs one blank panel after restart, nothing else */
+            }
+          },
+          persistent: true,
+        }
+      }
+    }
+  } catch {
+    /* fall through to the memory-only cache */
+  }
+  return {
+    read: (sessionID) => remembered.get(sessionID),
+    write: rememberSnapshot,
+    persistent: false,
+  }
 }
 
 /**
@@ -207,6 +330,7 @@ function FocusTodoPanel(props: { readonly context: TuiContext; readonly input: T
   // session the slot currently reports.
   const width = createMemo(() => rowWidth(props.context.renderer?.terminalWidth))
   const fold = createFold(props.context)
+  const snapshot = createSnapshot(props.context)
   const panel = createMemo(() => {
     try {
       const sessionID = props.input?.sessionID
@@ -216,7 +340,16 @@ function FocusTodoPanel(props: { readonly context: TuiContext; readonly input: T
         return buildPanel(undefined, width())
       }
       const messages = props.context.data?.session?.message?.list(sessionID) ?? []
-      return buildPanel(remember(sessionID, latestFocusState(messages)), width())
+      const hit = latestFocusHit(messages)
+      const fresh = hit === undefined ? undefined : { view: hit.view, ...(hit.at !== undefined ? { at: hit.at } : {}) }
+      const saved = snapshot.read(sessionID)
+      const chosen = chooseFocusView(fresh, saved)
+      // A fresh result always wins (or beats the cache by revision); the cache is
+      // only rewritten when it does not already hold this exact view.
+      if (chosen !== undefined && chosen !== saved?.view) {
+        snapshot.write(sessionID, { view: chosen, at: hit?.at ?? Date.now() })
+      }
+      return buildPanel(chosen, width(), Date.now())
     } catch {
       // A failed read must never take the sidebar down with it.
       return buildPanel(undefined, width())
@@ -233,16 +366,56 @@ function FocusTodoPanel(props: { readonly context: TuiContext; readonly input: T
         {`${fold.open() ? "▼" : "▶"} ${clip(panel()?.header ?? "", Math.max(1, width() - 2))}`}
       </text>
       <Show when={fold.open()}>
-        <For each={panel()?.rows ?? []}>
+        <For each={panel()?.openRows ?? []}>
           {(row: PanelRow) => (
             <text fg={statusColor(props.context.theme?.text, row.status)} truncate>
               {row.line}
             </text>
           )}
         </For>
+        <Show when={panel()?.active !== 0 && (panel()?.doneRows.length ?? 0) > 0}>
+          <text
+            fg={toHex(props.context.theme?.text?.muted)}
+            truncate
+            onMouseUp={() => fold.toggleDone()}
+          >
+            {clip(`${fold.doneOpen() ? "▾" : "▸"} ✓ ${panel()?.done ?? 0} done`, width())}
+          </text>
+          <Show when={fold.doneOpen()}>
+            <For each={panel()?.doneRows ?? []}>
+              {(row: PanelRow) => (
+                <text fg={statusColor(props.context.theme?.text, row.status)} truncate>
+                  {row.line}
+                </text>
+              )}
+            </For>
+          </Show>
+        </Show>
+        <Show when={panel()?.active === 0}>
+          <For each={panel()?.doneRows ?? []}>
+            {(row: PanelRow) => (
+              <text fg={statusColor(props.context.theme?.text, row.status)} truncate>
+                {row.line}
+              </text>
+            )}
+          </For>
+        </Show>
       </Show>
     </box>
   )
+}
+
+function doctorEnabled(): boolean {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
+  return env?.["FOCUS_TODO_DOCTOR"] === "1" || env?.["FOCUS_TODO_DOCTOR"] === "true"
+}
+
+function doctorLine(line: string): void {
+  try {
+    ;(globalThis as { console?: { warn?: (...args: unknown[]) => void } }).console?.warn?.(`[focus-todo/doctor] ${line}`)
+  } catch {
+    /* the probe must never cost the panel */
+  }
 }
 
 const mod = {
@@ -266,6 +439,24 @@ const mod = {
       })
     } catch {
       return undefined
+    }
+
+    if (doctorEnabled()) {
+      // Probe the one unpublished TUI surface this half depends on. The panel itself
+      // degrades to an in-memory fold/cache if the shape drifts, so the probe is how
+      // that silent degradation becomes visible.
+      let store = "absent"
+      try {
+        const candidate = context.storage?.store
+        if (typeof candidate === "function") {
+          const pair = candidate.call(context.storage, FOLD_KEY, { initial: { open: true, doneOpen: false } })
+          store = isFoldStorePair(pair) ? "pair" : "unexpected"
+        }
+      } catch {
+        store = "fail"
+      }
+      doctorLine(`tui.storage.store=${store}`)
+      doctorLine("tui.slot=ok")
     }
 
     return () => {

@@ -29,6 +29,7 @@ import { describe, expect, test } from "bun:test"
 import {
   applyAction,
   DEFAULT_SETTINGS,
+  DONE_ROWS_KEPT,
   DONE_TEXT_MAX,
   emptyState,
   formatReminder,
@@ -147,13 +148,14 @@ function assertInvariants(state: TodoState, context: string): void {
   check(parsed !== undefined, `panel cannot parse the tool result: ${where}`)
   check(parsed?.active === open.length, `panel active count: ${where}`)
   check(parsed?.done === state.completed, `panel done count: ${where}`)
-  // Marked rows are clipped in the tool result (open ones keep their full text), so the
-  // panel sees a shortened row for them — by design, and the only place text is lost.
+  // Only the newest marked rows are printed verbatim; the rest collapse into one
+  // `+N done` row, and the header's `done=` remains the authoritative count.
+  const kept = marked.slice(0, DONE_ROWS_KEPT)
   const shownText = (item: TodoItem): string =>
     item.done === true && item.text.length > DONE_TEXT_MAX
       ? `${item.text.slice(0, DONE_TEXT_MAX - 1)}\u2026`
       : item.text
-  const expectedRows = [...open, ...marked].map(
+  const expectedRows = [...open, ...kept].map(
     (item) => `${item.id}:${item.done === true ? "done" : item.status}:${shownText(item)}`,
   )
   const actualRows = (parsed?.items ?? []).map((item) => `${item.id}:${item.status}:${item.text}`)

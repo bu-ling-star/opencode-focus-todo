@@ -67,11 +67,16 @@ beforeEach(() => forgetPanelState())
 
 const SESSION = "ses_panel0000aaaaaaaaaaaaaaaaaaaaa"
 
-function toolPart(text: string) {
+function toolPart(text: string, metadata?: unknown) {
   return {
     type: "tool",
     name: TOOL_NAME,
-    state: { status: "completed", input: { action: "list" }, content: [{ type: "text", text }] },
+    state: {
+      status: "completed",
+      input: { action: "list" },
+      content: [{ type: "text", text }],
+      ...(metadata !== undefined ? { metadata } : {}),
+    },
   }
 }
 
@@ -85,7 +90,10 @@ const THEME = {
 }
 
 /** Records slot claims and their render functions. */
-function fakeContext(sessions: Record<string, unknown[]> = {}, options: { foldState?: { open: boolean } } = {}) {
+function fakeContext(
+  sessions: Record<string, unknown[]> = {},
+  options: { foldState?: { open: boolean; doneOpen?: boolean }; snapshot?: { sessions: Record<string, unknown> } } = {},
+) {
   const claims: {
     prepend?: string
     append?: string
@@ -93,6 +101,9 @@ function fakeContext(sessions: Record<string, unknown[]> = {}, options: { foldSt
     render: (input: { sessionID?: unknown }) => unknown
   }[] = []
   let unregistered = 0
+  const stored = new Map<string, unknown>()
+  if (options.foldState) stored.set("focus-todo.panel", options.foldState)
+  if (options.snapshot) stored.set("focus-todo.snapshot", options.snapshot)
   const context = {
     options: {},
     renderer: { terminalWidth: 120 },
@@ -104,16 +115,17 @@ function fakeContext(sessions: Record<string, unknown[]> = {}, options: { foldSt
         },
       },
     },
-    ...(options.foldState
+    ...(options.foldState || options.snapshot
       ? {
-          // Mimics the host's `storage.store`: same [state, setter] pair for the same
-          // key on every call, the setter mutating the shared state object.
+          // Mimics the host's `storage.store`: one shared state object per key, the
+          // setter mutating it in place, so every component instance sees the same data.
           storage: {
-            store(_key: string, _options: { initial: unknown }) {
-              const shared = options.foldState!
+            store(key: string, initial: { initial: unknown }) {
+              if (!stored.has(key)) stored.set(key, initial.initial)
+              const shared = stored.get(key) as { open?: boolean; doneOpen?: boolean; sessions?: Record<string, unknown> }
               return [
                 shared,
-                (updater: (draft: { open: boolean }) => void) => {
+                (updater: (draft: typeof shared) => void) => {
                   updater(shared)
                 },
               ]
@@ -245,6 +257,24 @@ describe("panel rendering", () => {
     expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ Focus 2 active, done 1 · 1 running", "▶ t1 implement storage", "○ t2 add tests"])
   })
 
+  test("prefers the structured metadata over the text dump", () => {
+    const meta = {
+      version: 1,
+      revision: 4,
+      active: 1,
+      completed: 0,
+      items: [{ id: "t1", text: "from metadata", status: "pending", done: false }],
+    }
+    const conversation: unknown[] = [
+      { type: "assistant", content: [toolPart("this text is not a todo dump", { metadata: { focus: meta } })] },
+    ]
+    const { context, claims } = fakeContext({ [SESSION]: conversation })
+    plugin.setup(context)
+
+    // The text alone would parse to undefined and render 暂无待办; the payload wins.
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ Focus 1 active", "○ t1 from metadata"])
+  })
+
   test("renders the count when nothing is open and no rows are left", () => {
     const { context, claims } = fakeContext({
       [SESSION]: [{ type: "assistant", content: [toolPart("0 active, done=4")] }],
@@ -323,6 +353,59 @@ describe("panel rendering", () => {
     // A cleared list is a real result and must still replace what was remembered.
     conversation.push({ type: "assistant", content: [toolPart("0 active, done=0")] })
     expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual(["▼ 暂无待办"])
+  })
+
+  test("restores the last view from host storage after a restart", () => {
+    // A restart empties the in-memory map and the host's 20-message window; the
+    // snapshot written before it is the only copy the TUI half can reach.
+    const snapshot = {
+      sessions: {
+        [SESSION]: {
+          view: { active: 1, done: 0, items: [{ id: "t1", status: "in_progress", text: "restored" }] },
+          at: 1_700_000_000_000,
+        },
+      },
+    }
+    const { context, claims } = fakeContext({ [SESSION]: [] }, { snapshot })
+    plugin.setup(context)
+
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual([
+      "▼ Focus 1 active · 1 running",
+      "▶ t1 restored",
+    ])
+  })
+
+  test("writes the newest structured view to the snapshot, and a fresh result beats it", () => {
+    const first = {
+      version: 1,
+      revision: 1,
+      active: 1,
+      completed: 0,
+      items: [{ id: "t1", text: "old", status: "pending", done: false }],
+    }
+    const conversation: unknown[] = [
+      { type: "assistant", content: [toolPart("", { metadata: { focus: first } })] },
+    ]
+    const snapshot: { sessions: Record<string, unknown> } = { sessions: {} }
+    const { context, claims } = fakeContext({ [SESSION]: conversation }, { snapshot })
+    plugin.setup(context)
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toContain("○ t1 old")
+    const saved = snapshot.sessions[SESSION] as { view: { revision: number; text?: string } }
+    expect(saved.view.revision).toBe(1)
+
+    // A newer result (higher revision) replaces both the panel and the cache.
+    conversation.push({
+      type: "assistant",
+      content: [
+        toolPart("", {
+          metadata: {
+            focus: { ...first, revision: 2, items: [{ id: "t2", text: "new", status: "pending", done: false }] },
+          },
+        }),
+      ],
+    })
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toContain("○ t2 new")
+    expect((snapshot.sessions[SESSION] as { view: { revision: number } }).view.revision).toBe(2)
   })
 
   test("a broken message store degrades to an empty panel, not a throw", () => {
@@ -429,6 +512,37 @@ describe("fold", () => {
     const lines = renderText(claims[0]?.render({ sessionID: SESSION }))
     expect(lines[0]).toBe("▼ Focus 1 active · 1 running")
     expect(lines).toContain("▶ t1 mine")
+  })
+
+  test("the done section folds on its own", () => {
+    const conversation = (): Record<string, unknown[]> => ({
+      [SESSION]: [
+        { type: "assistant", content: [toolPart("1 active, done=2\nt1:> running\nt2:x shipped\nt3:x tested")] },
+      ],
+    })
+    const foldState = { open: true, doneOpen: false }
+    const { context, claims } = fakeContext(conversation(), { foldState })
+    plugin.setup(context)
+
+    // Open work stays visible; the finished rows collapse behind one control.
+    expect(renderText(claims[0]?.render({ sessionID: SESSION }))).toEqual([
+      "▼ Focus 1 active, done 2 · 1 running",
+      "▶ t1 running",
+      "▸ ✓ 2 done",
+    ])
+
+    const control = findNode(
+      claims[0]?.render({ sessionID: SESSION }),
+      "text",
+      (node) => typeof node.props["children"] === "string" && node.props["children"].includes("✓ 2 done"),
+    )
+    expect(typeof control?.props["onMouseUp"]).toBe("function")
+    ;(control?.props["onMouseUp"] as () => void)()
+
+    expect(foldState.doneOpen).toBe(true)
+    const lines = renderText(claims[0]?.render({ sessionID: SESSION }))
+    expect(lines).toContain("✓ t2 shipped")
+    expect(lines).toContain("✓ t3 tested")
   })
 
   test("clicking the header folds the panel and persists the flag", () => {

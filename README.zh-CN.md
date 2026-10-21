@@ -74,7 +74,8 @@ rm -r ~/.config/opencode/plugin/focus-todo
 ```
 
 每个会话的状态以 `focus-todo/session/<sessionID>` 为键留在 OpenCode 自己的存储里。
-插件删除后它只是惰性数据，可以留着，也可以随会话一起自然过期。
+宿主报告会话被删除（`session.deleted`）时，插件会一并删除该键；只有插件未运行时发生的
+删除会留下惰性数据，不影响使用。
 
 ## 使用
 
@@ -90,7 +91,7 @@ rm -r ~/.config/opencode/plugin/focus-todo
 只移除行，不改变计数。旧的 `add`、`update`、`remove`、`batch`、`complete`、`clear`
 输入仍在运行时兼容，但不会出现在公开 schema 中。
 
-工具强制执行：最多 16 条开放项、最多保留 10 条完成行、每项最多 150 字符、最多一条
+工具强制执行：最多 `maxItems` 条开放项（默认 16）、最多 `maxDone` 条保留完成行（默认 10）、每项最多 150 字符、最多一条
 开放项为 `in_progress`；空文本、非法状态、重复 id、未知 id 会明确报错；`mutate` 任一
 操作失败时整批不写入。
 
@@ -161,6 +162,9 @@ TUI
   "reminder": true,
   "reminderBudget": 360,
   "staleAfter": 0,
+  "maxItems": 16,
+  "maxDone": 10,
+  "stalledAfter": 0,
   "itemChars": 48,
   "maintenanceNudge": " — update if changed",
   "creationNudge": "[focus_todo] no list yet"
@@ -172,12 +176,18 @@ TUI
 | `reminder` | `true` | 开启请求尾提醒；`false` 时连 session hook 都不访问。 |
 | `reminderBudget` | `360` | 生成提醒的最大字符数。 |
 | `staleAfter` | `0` | 安静 hook 调用数达到该值后才允许维护催更；`0` 只关闭维护催更，每会话一次的邀请不受影响。 |
+| `maxItems` | `16` | 开放项上限（1–64）。调大会改变工具 schema，从而开启新的缓存前缀。 |
+| `maxDone` | `10` | 保留完成行上限（0–50）。 |
+| `stalledAfter` | `0` | `in_progress` 行超过该分钟数后，提醒追加 `(stalled)`；`0` 关闭标记，侧边栏始终显示停留时长。 |
 | `itemChars` | `48` | 提醒中每项的截断长度。 |
 | `maintenanceNudge` | ` — update if changed` | 开启维护 nudge 时附加的短句。 |
 | `creationNudge` | `[focus_todo] no list yet` | 空会话那条每会话一次邀请使用的短句。 |
 
-`FOCUS_TODO_REMINDER`、`FOCUS_TODO_REMINDER_BUDGET`、`FOCUS_TODO_STALE_AFTER` 和
-`FOCUS_TODO_ITEM_CHARS` 可用环境变量覆盖文件配置。
+`FOCUS_TODO_REMINDER`、`FOCUS_TODO_REMINDER_BUDGET`、`FOCUS_TODO_STALE_AFTER`、
+`FOCUS_TODO_ITEM_CHARS`、`FOCUS_TODO_MAX_ITEMS`、`FOCUS_TODO_MAX_DONE` 和
+`FOCUS_TODO_STALLED_AFTER` 可用环境变量覆盖文件配置。`FOCUS_TODO_DOCTOR=1` 会在启动时
+为插件依赖的每个宿主面各打印一行自检结果（tool transform、context hook、storage、
+agent registry、TUI storage）。
 
 ### 为什么提醒不破坏缓存
 
@@ -207,20 +217,29 @@ TUI 注册一个只读面板：
 
 | 会话状态 | 面板 |
 | --- | --- |
-| 有开放项 | `Focus N active[, done M]`，然后开放行与保留的完成行 |
+| 有开放项 | `Focus N active[, done M][ · K running]`，开放行，然后是可折叠的 `✓ M done` 区 |
 | 无开放项但有完成行 | `Focus: all done`，然后完成行 |
 | 无开放项且完成行也移除 | `Focus 0 active, done N` |
 | 尚未建清单或 `replace(items: [])` 后 | `暂无待办` |
 
-面板刻意没有“已提醒/未提醒”状态行。提醒属于请求 hook，TUI 进程无法可靠重建它；面板只读取
-最新可解析的 `focus_todo` 工具结果，不写状态、不轮询，也不建立第二份待办存储。
+运行中的行超过整分钟后显示停留时长（`▶ t1 12m fix parser`）。点击 `✓ N done` 只折叠完成区；
+点击 header 仍折叠整个面板。最近 1 条完成行保留原文，其余由 header 的计数概括。
+
+面板刻意没有“已提醒/未提醒”状态行。提醒属于请求 hook，TUI 进程无法可靠重建它；面板优先读取
+最新完成 `focus_todo` part 上的结构化 `metadata.focus`，窗口里只有旧结果时才回退到文本解析。
+它从不写待办状态：持久化的两个值——折叠开关和每会话有界的最后视图快照——走宿主自己的
+`storage.store`，所以重启或工具结果滑出 20 条消息窗口时，面板不会在清单仍在 storage 里时
+退回 `暂无待办`。快照只是 UI 缓存，永远会被新的工具结果替换，服务端从不读取它。
 
 ## 它如何不打扰别人
 
 * **存储就是 OpenCode 自己的。** 状态走官方 `context.storage` 键值域，每会话一键。
-  没有插件 JSON 文件、没有数据库、没有迁移。
+  没有第二份插件存储、没有数据库、没有迁移。侧边栏快照走宿主自己的 UI storage
+  （`storage.store`），服务端从不读回。
 * **失败从不阻塞启动。** setup 按特性逐一守卫：工具注册失败，提醒和面板完好；钩子
-  失败只损失提醒；状态读不动则带警告重置；读失败时拒绝写入而不是覆盖已有的清单；同一会话的写操作串行化，不丢数据。
+  失败只损失提醒；状态读不动则带警告重置；读写失败会让工具调用直接报错（宿主标红），
+  而不是返回一个伪装成成功的 `error=...` 字符串，侧边栏则保留上一次视图；同一会话的
+  写操作串行化，不丢数据。
 * **与 billion-context 共存。** 它只注册一个工具（`focus_todo`），从不触碰
   billion-context 的工具、头、提示或状态，移除 billion-context 后照常工作。共存是实测
   的，不是假设的：在录得的捕获上 **16/16** 请求携带 billion-context 的

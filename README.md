@@ -79,8 +79,9 @@ rm -r ~/.config/opencode/plugin/focus-todo
 ```
 
 Per-session state stays behind as keys named `focus-todo/session/<sessionID>` in OpenCode's
-own storage. It is inert once the plugin is gone; leave it or let it age out with the
-sessions it belongs to.
+own storage. The plugin removes that key when the host reports the session deleted
+(`session.deleted`); a row left by a deletion that happened while the plugin was not
+running is inert and harmless.
 
 ## Usage
 
@@ -99,7 +100,7 @@ compatibility, but are intentionally absent from the public schema.
 
 Rules enforced by the tool:
 
-* at most 16 open items and 10 retained done rows;
+* at most `maxItems` open items (default 16) and `maxDone` retained done rows (default 10);
 * at most 150 characters per item;
 * at most one open item `in_progress`;
 * ids are short, stable and never reused within a session;
@@ -183,6 +184,9 @@ Optional config: `~/.config/opencode/focus-todo.json` (or next to `server.ts`). 
   "reminder": true,
   "reminderBudget": 360,
   "staleAfter": 0,
+  "maxItems": 16,
+  "maxDone": 10,
+  "stalledAfter": 0,
   "itemChars": 48,
   "maintenanceNudge": " — update if changed",
   "creationNudge": "[focus_todo] no list yet"
@@ -194,13 +198,18 @@ Optional config: `~/.config/opencode/focus-todo.json` (or next to `server.ts`). 
 | `reminder` | `true` | Enable the request-tail reminder. `false` skips the session hook entirely. |
 | `reminderBudget` | `360` | Maximum generated reminder length in characters. |
 | `staleAfter` | `0` | Number of quiet hook calls before the optional maintenance nudge. `0` disables that nudge only; the once-per-session invitation is unconditional. |
+| `maxItems` | `16` | Open-item cap (1–64). Raising it changes the tool schema, so it starts a new cache prefix. |
+| `maxDone` | `10` | Retained done-row cap (0–50). |
+| `stalledAfter` | `0` | Minutes an `in_progress` row may run before the reminder appends `(stalled)`. `0` disables the marker; the sidebar shows the age either way. |
 | `itemChars` | `48` | Per-item clipping inside the reminder. |
 | `maintenanceNudge` | ` — update if changed` | Optional short clause for an enabled maintenance nudge. |
 | `creationNudge` | `[focus_todo] no list yet` | Line for the once-per-session invitation an empty session draws. |
 
 The environment variables `FOCUS_TODO_REMINDER`, `FOCUS_TODO_REMINDER_BUDGET`,
-`FOCUS_TODO_STALE_AFTER` and `FOCUS_TODO_ITEM_CHARS` override file values for tests or
-one-off runs.
+`FOCUS_TODO_STALE_AFTER`, `FOCUS_TODO_ITEM_CHARS`, `FOCUS_TODO_MAX_ITEMS`,
+`FOCUS_TODO_MAX_DONE` and `FOCUS_TODO_STALLED_AFTER` override file values for tests or
+one-off runs. `FOCUS_TODO_DOCTOR=1` prints one diagnostic line per host surface the plugin
+depends on at startup (tool transform, context hook, storage, agent registry, TUI storage).
 
 ### Why the reminder is cache-safe
 
@@ -236,25 +245,35 @@ The TUI registers one read-only panel:
 
 | Session state | Panel |
 | --- | --- |
-| open items | `Focus N active[, done M]`, then open rows and retained done rows |
+| open items | `Focus N active[, done M][ · K running]`, open rows, then a collapsible `✓ M done` section |
 | no open items, retained done rows | `Focus: all done`, then the done rows |
 | no open items and no retained rows | `Focus 0 active, done N` |
 | no list yet or after `replace(items: [])` | `暂无待办` |
 
+A running row shows its age (`▶ t1 12m fix parser`) once a whole minute has passed. The done
+section folds on its own by clicking its `✓ N done` row; clicking the header still folds the
+whole panel. The newest done row is kept verbatim, the rest are counted by the header.
+
 The panel intentionally has no “reminded / not reminded” status line. Reminder delivery belongs to
-the request hook and cannot be truthfully reconstructed by the separate TUI process. The panel reads
-only the newest parseable `focus_todo` result, writes nothing, polls nothing, and does not create
-a second todo store.
+the request hook and cannot be truthfully reconstructed by the separate TUI process. The panel
+prefers the structured `metadata.focus` on the newest completed `focus_todo` part and falls back
+to parsing its text when an older result is all the window holds. It never writes todo state: its
+two persisted UI values — the fold flags and a bounded per-session copy of the last view — go
+through the host's own `storage.store`, so a restart does not blank the panel while the list is
+still in storage. The cache is always replaced by a fresh result and is never read by the server
+half.
 
 ## How it stays out of the way
 
 * **Storage is OpenCode's own.** State goes through the official `context.storage` key/value
-  domain, one key per session. No plugin JSON file, no database, no migrations.
+  domain, one key per session. No second plugin store, no database, no migrations. The sidebar's
+  snapshot cache uses the host's own UI storage (`storage.store`) and is never read back by the
+  server half.
 * **Failure never blocks startup.** Setup is fully guarded per feature: a failing tool
   registration leaves the reminder and the panel intact, a failing hook costs only the
-  reminder, unreadable state is reset with a warning, a read failure refuses the write
-  instead of overwriting the stored list, and mutations on one session are serialized so
-  nothing is lost.
+  reminder, unreadable state is reset with a warning, and a failed read or write makes the tool
+  call fail loudly instead of returning a success-shaped error string (the sidebar then keeps
+  its last view). Mutations on one session are serialized so nothing is lost.
 * **Coexists with billion-context.** It registers exactly one tool (`focus_todo`), never
   touches billion-context's tools, headers, prompts, config or state, and works normally with
   billion-context removed. The plugin does not edit billion-context settings. If you run

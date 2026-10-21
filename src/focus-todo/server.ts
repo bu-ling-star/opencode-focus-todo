@@ -10,11 +10,15 @@
  *   outbound request, so the cacheable prefix (system prompt, tool definitions, history) is
  *   never touched; nothing is injected into the system prompt and no synthetic message is
  *   ever persisted (see `injectTail` and §9.8 of IMPLEMENTATION_NOTES.md);
- * - at most 16 open items, at most 150 chars per item, at most one `in_progress`;
+ * - at most `maxItems` open items (default 16), at most 150 chars per item, at most one
+ *   `in_progress`;
  * - marking done (`update` with `done: true`) keeps the row instead of deleting it: marked
  *   rows stay in the sidebar and in the tool result (short) but never in the per-request
  *   reminder, which stays open-only;
- * - every failure path is soft: setup never throws, corrupt state is reset, writes are serialized.
+ * - setup never throws and corrupt state is reset; a tool call that cannot read or write
+ *   storage throws instead of returning a success-shaped `error=...` string, so the host
+ *   marks the part as failed and the sidebar falls back to its last known view;
+ * - writes are serialized per session.
  *
  * Zero imports by design: the module stays importable by a test runner and cannot
  * break OpenCode startup by failing to resolve a package.
@@ -28,6 +32,11 @@ export interface TodoItem {
   status: TodoStatus
   /** Set by `update` with `done: true`: kept for the sidebar and the tool result, hidden from the reminder. */
   done?: boolean
+  /**
+   * Epoch milliseconds when this row entered `in_progress`. Optional so states written by
+   * older versions stay valid; cleared whenever the row leaves `in_progress` or is marked done.
+   */
+  startedAt?: number
 }
 
 export interface TodoState {
@@ -43,6 +52,45 @@ export interface TodoState {
   nextId: number
   items: TodoItem[]
 }
+
+/** One row of the structured result; the sidebar reads this instead of parsing the text. */
+export interface FocusMetaItem {
+  id: string
+  text: string
+  status: TodoStatus
+  done: boolean
+  startedAt?: number
+}
+
+/**
+ * Structured side-channel returned in `Tool.Result.metadata`. The host persists it on
+ * the completed tool part, but never sends it to the model: verified against the
+ * captured outbound request. The persisted shape depends on the host build — the
+ * current CLI stores `state.metadata.focus`, an earlier one wrapped it once more as
+ * `state.metadata.metadata.focus` — so the panel accepts both. It is versioned so the
+ * TUI half can reject a shape it does not understand and fall back to the text dump.
+ */
+export interface FocusMeta {
+  version: 1
+  /** Revision of the state this result describes; newer snapshots win in the sidebar. */
+  revision: number
+  active: number
+  completed: number
+  items: FocusMetaItem[]
+}
+
+/** Per-session caps. The defaults keep the shipped behaviour; settings may raise them. */
+export interface Limits {
+  items: number
+  done: number
+}
+
+export const MAX_ITEMS = 16
+/** Marked items kept per session; the oldest ones are dropped once this is exceeded. */
+export const MAX_DONE = 10
+export const DEFAULT_LIMITS: Limits = { items: MAX_ITEMS, done: MAX_DONE }
+/** Hard ceilings for settings: a config typo cannot turn one result into a megabyte. */
+export const LIMITS_MAX = { items: 64, done: 50 } as const
 
 /**
  * One local mutation inside `mutate`. Keeping this set small makes the public
@@ -77,6 +125,8 @@ export type LegacyFocusTodoInput =
 export interface Storage {
   get(key: string): Promise<unknown>
   set(key: string, value: unknown): Promise<void>
+  /** Drops a key. Optional so a host (or a test double) without it stays usable. */
+  remove?(key: string): Promise<void>
 }
 
 export interface ActionResult {
@@ -92,14 +142,13 @@ export type ActionFailure = { ok: false; error: string }
 export type ActionOutcome = ActionResult | ActionFailure
 
 export const TOOL_NAME = "focus_todo"
-export const MAX_ITEMS = 16
-/** Marked items kept per session; the oldest ones are dropped once this is exceeded. */
-export const MAX_DONE = 10
 export const MAX_TEXT = 150
-/** Upper bound on one mutation envelope: a plan holds at most 16 open items, so 24 ops covers any realistic reshuffle. */
+/** Upper bound on one mutation envelope: the default plan holds 16 open items, so 24 ops covers any realistic reshuffle. */
 export const MAX_BATCH_OPS = 24
 /** Done rows appear in every tool result, so keep them compact while retaining a useful label. */
-export const DONE_TEXT_MAX = 48
+export const DONE_TEXT_MAX = 32
+/** Newest done rows kept verbatim; the rest collapse into one `+N done` summary row. */
+export const DONE_ROWS_KEPT = 1
 export const KEY_PREFIX = "focus-todo/session/"
 
 /**
@@ -108,10 +157,11 @@ export const KEY_PREFIX = "focus-todo/session/"
  *   <config>/opencode/focus-todo.json      (~/.config/opencode/focus-todo.json)
  *   <plugin dir>/focus-todo.json           (fallback, next to server.ts)
  *
- * Shape: `{ "reminder": true, "reminderBudget": 360, "staleAfter": 0 }`. Missing file,
- * missing key, wrong type or broken JSON all fall back to the defaults below, so the
- * plugin can never be configured into a broken state. The environment variables of the
- * same names are honoured as an override for tests and one-off runs.
+ * Shape: `{ "reminder": true, "reminderBudget": 360, "staleAfter": 0, "maxItems": 16,
+ * "maxDone": 10, "stalledAfter": 0 }`. Missing file, missing key, wrong type or broken
+ * JSON all fall back to the defaults below, so the plugin can never be configured into a
+ * broken state. The environment variables of the same names are honoured as an override
+ * for tests and one-off runs.
  */
 export interface Settings {
   /** Append the current list as the last message of the tail. */
@@ -130,6 +180,15 @@ export interface Settings {
    * is independent of it, and the informative reminder is unaffected.
    */
   staleAfter: number
+  /** Open-item cap for one session. Raising it changes the tool schema, so it starts a new cache prefix. */
+  maxItems: number
+  /** Marked-row cap for one session. */
+  maxDone: number
+  /**
+   * Minutes an `in_progress` row may run before the reminder appends `(stalled)`.
+   * 0 disables the marker; the reminder text is otherwise unchanged.
+   */
+  stalledAfter: number
   /** Per-item clip inside the reminder line. The tool result keeps the full text. */
   itemChars: number
   /** Clause appended to the state line when the list has gone stale. */
@@ -144,6 +203,9 @@ export const DEFAULT_SETTINGS: Settings = {
   // Disabled by default: the normal reminder is enough once a plan exists. The
   // once-per-session invitation is not gated on this.
   staleAfter: 0,
+  maxItems: MAX_ITEMS,
+  maxDone: MAX_DONE,
+  stalledAfter: 0,
   itemChars: 48,
   maintenanceNudge: " — update if changed",
   creationNudge: "[focus_todo] no list yet",
@@ -153,6 +215,10 @@ const REMINDER_BUDGET_MIN = 80
 const REMINDER_BUDGET_MAX = 2000
 const STALE_AFTER_MIN = 0
 const STALE_AFTER_MAX = 200
+const STALLED_AFTER_MIN = 0
+const STALLED_AFTER_MAX = 1440
+const MAX_ITEMS_MIN = 1
+const MAX_DONE_MIN = 0
 const ITEM_CHARS_MIN = 16
 const ITEM_CHARS_MAX = 200
 /** Both nudge texts are one line of the tail; a typo cannot be allowed to flood it. */
@@ -200,6 +266,18 @@ export function resolveSettings(raw: unknown, env: Record<string, string | undef
     numberSetting(env["FOCUS_TODO_STALE_AFTER"], STALE_AFTER_MIN, STALE_AFTER_MAX) ??
     numberSetting(file?.["staleAfter"], STALE_AFTER_MIN, STALE_AFTER_MAX) ??
     DEFAULT_SETTINGS.staleAfter
+  const maxItems =
+    numberSetting(env["FOCUS_TODO_MAX_ITEMS"], MAX_ITEMS_MIN, LIMITS_MAX.items) ??
+    numberSetting(file?.["maxItems"], MAX_ITEMS_MIN, LIMITS_MAX.items) ??
+    DEFAULT_SETTINGS.maxItems
+  const maxDone =
+    numberSetting(env["FOCUS_TODO_MAX_DONE"], MAX_DONE_MIN, LIMITS_MAX.done) ??
+    numberSetting(file?.["maxDone"], MAX_DONE_MIN, LIMITS_MAX.done) ??
+    DEFAULT_SETTINGS.maxDone
+  const stalledAfter =
+    numberSetting(env["FOCUS_TODO_STALLED_AFTER"], STALLED_AFTER_MIN, STALLED_AFTER_MAX) ??
+    numberSetting(file?.["stalledAfter"], STALLED_AFTER_MIN, STALLED_AFTER_MAX) ??
+    DEFAULT_SETTINGS.stalledAfter
   const itemChars =
     numberSetting(env["FOCUS_TODO_ITEM_CHARS"], ITEM_CHARS_MIN, ITEM_CHARS_MAX) ??
     numberSetting(file?.["itemChars"], ITEM_CHARS_MIN, ITEM_CHARS_MAX) ??
@@ -209,7 +287,22 @@ export function resolveSettings(raw: unknown, env: Record<string, string | undef
   // so wording is free; only the length is clamped.
   const maintenanceNudge = textSetting(file?.["maintenanceNudge"]) ?? DEFAULT_SETTINGS.maintenanceNudge
   const creationNudge = textSetting(file?.["creationNudge"]) ?? DEFAULT_SETTINGS.creationNudge
-  return { reminder, reminderBudget: budget, staleAfter, itemChars, maintenanceNudge, creationNudge }
+  return {
+    reminder,
+    reminderBudget: budget,
+    staleAfter,
+    maxItems,
+    maxDone,
+    stalledAfter,
+    itemChars,
+    maintenanceNudge,
+    creationNudge,
+  }
+}
+
+/** The caps a loaded `Settings` maps to. */
+export function limitsOf(settings: Settings): Limits {
+  return { items: settings.maxItems, done: settings.maxDone }
 }
 
 /** The config file next to the plugin, derived from this module's own URL. */
@@ -260,65 +353,72 @@ export async function loadSettings(
 }
 
 export const TOOL_DESCRIPTION =
-  'Session focus list for multi-step work. For 3+ steps, start with action="replace"; skip trivial work. ' +
-  'Use action="list" on resume/compaction/restart, or action="mutate" with 1–24 add/update/remove ops. ' +
-  'Keep items short; set one in_progress before work; set done:true only after verification, leaving partial, blocked, or failing work open. ' +
-  'Results mark each row as > running, - pending, ! blocked, x done.'
+  'Session focus for multi-step work: 3+ steps → action="replace"; skip trivial work. ' +
+  'action="list" on resume/compaction/restart; action="mutate" for 1–24 add/update/remove ops. ' +
+  'Keep items short; one in_progress before work; done:true only after verification; keep partial, blocked, or failing work open. ' +
+  'Rows: > running, - pending, ! blocked, x done.'
 
 const STATUSES: readonly TodoStatus[] = ["pending", "in_progress", "blocked"]
 const MARK: Record<TodoStatus, string> = { in_progress: ">", pending: "-", blocked: "!" }
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,16}$/
 
-/** Fixed input schema. Todo content never changes it, so the tool prefix stays cacheable. */
-export const INPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    action: {
-      type: "string",
-      enum: ["list", "replace", "mutate"],
-      description: "list: read. replace: overwrite all. mutate: apply add/update/remove ops atomically.",
-    },
-    items: {
-      type: "array",
-      description: "For replace: new plan; [] clears rows and done count.",
-      maxItems: MAX_ITEMS,
-      items: {
-        type: "object",
-        properties: {
-          id: { type: "string", description: "Existing id to keep; omit for a new id." },
-          text: { type: "string", description: `Item text, max ${MAX_TEXT} chars.` },
-          status: { type: "string", enum: ["pending", "in_progress", "blocked"] },
-        },
-        required: ["text"],
-        additionalProperties: false,
+/**
+ * Input schema for the configured caps. The schema is still fixed for the life of a
+ * process, so the tool prefix stays cacheable; changing `maxItems` in settings starts
+ * a new process and therefore a new prefix, which is a one-time cost.
+ */
+export function inputSchema(limits: Limits = DEFAULT_LIMITS) {
+  return {
+    type: "object",
+    properties: {
+      action: {
+        type: "string",
+        enum: ["list", "replace", "mutate"],
       },
-    },
-    ops: {
-      type: "array",
-      description: `For mutate: 1–${MAX_BATCH_OPS} ops, applied in order, all-or-nothing.`,
-      minItems: 1,
-      maxItems: MAX_BATCH_OPS,
       items: {
-        type: "object",
-        properties: {
-          action: {
-            type: "string",
-            enum: ["add", "update", "remove"],
-            description: "One local mutation; replace is top-level only.",
+        type: "array",
+        description: "replace: full plan; [] clears all.",
+        maxItems: limits.items,
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            text: { type: "string" },
+            status: { type: "string", enum: ["pending", "in_progress", "blocked"] },
           },
-          text: { type: "string", description: `For add/update: max ${MAX_TEXT} chars.` },
-          id: { type: "string", description: "For update/remove." },
-          status: { type: "string", enum: ["pending", "in_progress", "blocked"] },
-          done: { type: "boolean", enum: [true], description: "For update: marks done; retained as a row." },
+          required: ["text"],
+          additionalProperties: false,
         },
-        required: ["action"],
-        additionalProperties: false,
+      },
+      ops: {
+        type: "array",
+        description: `mutate: 1–${MAX_BATCH_OPS} atomic ops, in order.`,
+        minItems: 1,
+        maxItems: MAX_BATCH_OPS,
+        items: {
+          type: "object",
+          properties: {
+            action: {
+              type: "string",
+              enum: ["add", "update", "remove"],
+            },
+            text: { type: "string" },
+            id: { type: "string", description: "update/remove target." },
+            status: { type: "string", enum: ["pending", "in_progress", "blocked"] },
+            done: { type: "boolean", enum: [true], description: "true marks done; row kept." },
+          },
+          required: ["action"],
+          additionalProperties: false,
+        },
       },
     },
-  },
-  required: ["action"],
-  additionalProperties: false,
-} as const
+    required: ["action"],
+    additionalProperties: false,
+  }
+}
+
+/** The shipped schema, re-exported for tests and documentation that pin the tool prefix. */
+export const INPUT_SCHEMA = inputSchema(DEFAULT_LIMITS)
 
 export const OUTPUT_SCHEMA = { type: "string" } as const
 
@@ -341,18 +441,44 @@ function canonical(items: TodoItem[]): TodoItem[] {
   return [...items.filter((item) => !isDone(item)), ...items.filter(isDone)]
 }
 
-/** Enforce both caps: at most `MAX_ITEMS` open, the newest `MAX_DONE` marked. */
-function capped(items: TodoItem[]): TodoItem[] {
+/** Enforce both caps: at most `limits.items` open, the newest `limits.done` marked. */
+function capped(items: TodoItem[], limits: Limits = DEFAULT_LIMITS): TodoItem[] {
   const ordered = canonical(items)
   return [
-    ...ordered.filter((item) => !isDone(item)).slice(0, MAX_ITEMS),
-    ...ordered.filter(isDone).slice(0, MAX_DONE),
+    ...ordered.filter((item) => !isDone(item)).slice(0, limits.items),
+    ...ordered.filter(isDone).slice(0, limits.done),
   ]
 }
 
 /** The `N active, done=M` header, shared by the tool result and the reminder's dedup guard. */
 function stateHeader(state: TodoState): string {
   return `${openItems(state).length} active, done=${state.completed}`
+}
+
+/** A caller-supplied clock is only trusted when it is a real epoch; otherwise no timestamp is set. */
+function timestamp(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) return undefined
+  return Math.round(value)
+}
+
+/** The structured side-channel the sidebar prefers over parsing the text dump. */
+export function focusMeta(state: TodoState): FocusMeta {
+  return {
+    version: 1,
+    revision: state.revision,
+    active: openItems(state).length,
+    completed: state.completed,
+    items: state.items.map((item) => {
+      const row: FocusMetaItem = {
+        id: item.id,
+        text: item.text,
+        status: item.status,
+        done: isDone(item),
+      }
+      if (item.startedAt !== undefined) row.startedAt = item.startedAt
+      return row
+    }),
+  }
 }
 
 export function emptyState(): TodoState {
@@ -387,7 +513,7 @@ function isCount(value: unknown): value is number {
  * violates the invariants (too many items, several in_progress, duplicate ids)
  * is repaired in place instead of being thrown away.
  */
-export function normalizeState(raw: unknown): { state: TodoState; corrupt: boolean } {
+export function normalizeState(raw: unknown, limits: Limits = DEFAULT_LIMITS): { state: TodoState; corrupt: boolean } {
   if (raw === undefined || raw === null) return { state: emptyState(), corrupt: false }
   if (typeof raw !== "object" || Array.isArray(raw)) return { state: emptyState(), corrupt: true }
 
@@ -409,20 +535,31 @@ export function normalizeState(raw: unknown): { state: TodoState; corrupt: boole
     const text = item.text.trim().replace(/\s+/g, " ")
     if (text.length === 0) return { state: emptyState(), corrupt: true }
     seen.add(item.id)
+    const done = item.done === true
+    const startedAt =
+      !done && item.status === "in_progress" && typeof item.startedAt === "number" && Number.isFinite(item.startedAt)
+        ? timestamp(item.startedAt)
+        : undefined
     items.push({
       id: item.id,
       text: text.slice(0, MAX_TEXT),
       status: item.status,
-      done: item.done === true,
+      done,
+      ...(startedAt !== undefined ? { startedAt } : {}),
     })
   }
 
-  const kept = capped(items)
+  const kept = capped(items, limits)
   let inProgress = false
   for (const item of kept) {
     if (isDone(item)) continue
     if (item.status !== "in_progress") continue
-    if (inProgress) item.status = "pending"
+    if (inProgress) {
+      // A repaired duplicate must not keep a timer: only the row that stays
+      // in_progress owns the start timestamp.
+      item.status = "pending"
+      delete item.startedAt
+    }
     inProgress = true
   }
 
@@ -491,13 +628,22 @@ function clone(state: TodoState, items: TodoItem[], patch: Partial<TodoState> = 
 }
 
 export function formatState(state: TodoState): string {
-  const rows = canonical(state.items).map((item) => {
-    if (isDone(item)) {
+  const ordered = canonical(state.items)
+  const open = ordered.filter((item) => !isDone(item))
+  const done = ordered.filter(isDone)
+  // A long plan can finish a dozen rows; repeating every clipped label in every
+  // tool result is pure history weight. The newest one stays verbatim (it is the
+  // row a reader checks), the rest become one count in the header's own unit.
+  const keptDone = done.slice(0, DONE_ROWS_KEPT)
+  const hiddenDone = done.length - keptDone.length
+  const rows = [
+    ...open.map((item) => `${item.id}:${MARK[item.status]} ${item.text}`),
+    ...keptDone.map((item) => {
       const text = item.text.length > DONE_TEXT_MAX ? `${item.text.slice(0, DONE_TEXT_MAX - 1)}\u2026` : item.text
       return `${item.id}:x ${text}`
-    }
-    return `${item.id}:${MARK[item.status]} ${item.text}`
-  })
+    }),
+    ...(hiddenDone > 0 ? [`+${hiddenDone} done`] : []),
+  ]
   const header = stateHeader(state)
   return rows.length === 0 ? header : [header, ...rows].join("\n")
 }
@@ -516,12 +662,34 @@ const REMINDER_TAIL_RESERVE = 12
  */
 const REMINDER_WRAP = { open: "<system-reminder>\n", close: "\n</system-reminder>" } as const
 const REMINDER_WRAP_LENGTH = REMINDER_WRAP.open.length + REMINDER_WRAP.close.length
+/**
+ * Cheap provenance marker for a bare state line. It is charged to the reminder
+ * budget, unlike the 37-character shell, and does not depend on a provider
+ * accepting a system message at the end of the request.
+ */
+const PLAN_PREFIX = "[plan] "
 
 /** Floor for the reminder *line* itself: small enough that the shell and a clause still fit inside the configured budget. */
 const REMINDER_LINE_MIN = 24
 
 /** What deserves the model's attention first: what is running, then what is stuck. */
 const ATTENTION_RANK: Record<TodoStatus, number> = { in_progress: 0, blocked: 1, pending: 2 }
+
+/** Optional clock/threshold for the `(stalled)` marker. Both are absent by default. */
+export interface ReminderOptions {
+  /** Epoch milliseconds. No marker is emitted without a clock, which keeps the pure core deterministic. */
+  now?: number
+  /** Minutes before an `in_progress` row is called stalled; 0 or undefined disables the marker. */
+  stalledAfter?: number
+}
+
+function stalledSuffix(item: TodoItem, options: ReminderOptions): string {
+  const minutes = options.stalledAfter
+  const now = options.now
+  if (minutes === undefined || minutes <= 0 || now === undefined) return ""
+  if (item.status !== "in_progress" || item.startedAt === undefined) return ""
+  return now - item.startedAt >= minutes * 60_000 ? " (stalled)" : ""
+}
 
 /**
  * One compact line describing the open items, used as the trailing reminder on
@@ -538,6 +706,7 @@ export function formatReminder(
   state: TodoState,
   budget: number = DEFAULT_SETTINGS.reminderBudget,
   itemChars: number = DEFAULT_SETTINGS.itemChars,
+  options: ReminderOptions = {},
 ): string | undefined {
   // Marked items are deliberately absent here: this line is re-sent at eligible user-turn starts and the
   // model only needs what is still open (the header still carries the `done` count).
@@ -555,7 +724,7 @@ export function formatReminder(
   let used = head.length
   for (const item of ordered) {
     const text = item.text.length > itemChars ? `${item.text.slice(0, itemChars - 1)}…` : item.text
-    const entry = `${item.id}${MARK[item.status]} ${text}`
+    const entry = `${item.id}${MARK[item.status]} ${text}${stalledSuffix(item, options)}`
     const cost = parts.length === 0 ? entry.length : entry.length + 3 // " | "
     // The first entry is always kept: dropping the running item would defeat the point.
     if (parts.length > 0 && used + cost + REMINDER_TAIL_RESERVE > limited) break
@@ -595,6 +764,7 @@ export function compactReminder(
   state: TodoState,
   budget: number = DEFAULT_SETTINGS.reminderBudget,
   itemChars: number = DEFAULT_SETTINGS.itemChars,
+  options: ReminderOptions = {},
 ): string | undefined {
   const open = openItems(state)
   const first = [...open].sort((a, b) => ATTENTION_RANK[a.status] - ATTENTION_RANK[b.status])[0]
@@ -603,7 +773,7 @@ export function compactReminder(
   const done = state.completed > 0 ? `, ${state.completed} done` : ""
   const head = `[${TOOL_NAME}] ${open.length} open${done}, unchanged: `
   const text = first.text.length > itemChars ? `${first.text.slice(0, itemChars - 1)}…` : first.text
-  const line = `${head}${first.id}${MARK[first.status]} ${text}`
+  const line = `${head}${first.id}${MARK[first.status]} ${text}${stalledSuffix(first, options)}`
   if (line.length <= limited) return line
   // Clipping the entry would leave a fragment that reads like a truncated id or word.
   // Keep the anchor — the counts and `unchanged` — and drop the entry instead.
@@ -617,7 +787,9 @@ export function compactReminder(
  * re-read from storage compares equal to the one that produced the last line.
  */
 export function stateSignature(state: TodoState): string {
-  return `${state.items.map((item) => `${item.id}${item.status}:${item.text}`).join("\u0000")}|${state.completed}`
+  return `${state.items
+    .map((item) => `${item.id}${item.status}:${item.text}:${item.startedAt ?? 0}`)
+    .join("\u0000")}|${state.completed}`
 }
 
 function fail(error: string): ActionFailure {
@@ -625,11 +797,24 @@ function fail(error: string): ActionFailure {
 }
 
 /**
- * Pure state transition: no IO, no clock, no randomness, so it is exhaustively
- * testable and every result is reproducible.
+ * Pure state transition: no IO and no randomness. `now` is injected rather than read
+ * here, so a caller that does not care about timestamps gets the same deterministic
+ * result as before.
  */
-export function applyAction(state: TodoState, input: FocusTodoInput | LegacyFocusTodoInput): ActionOutcome {
+export interface ApplyOptions {
+  limits?: Limits
+  /** Epoch milliseconds for `startedAt`; omitted in pure tests, supplied by `handle`. */
+  now?: number
+}
+
+export function applyAction(
+  state: TodoState,
+  input: FocusTodoInput | LegacyFocusTodoInput,
+  options: ApplyOptions = {},
+): ActionOutcome {
   const action = (input as { action?: unknown } | null | undefined)?.action
+  const limits = options.limits ?? DEFAULT_LIMITS
+  const now = timestamp(options.now)
 
   switch (action) {
     case "list":
@@ -638,7 +823,7 @@ export function applyAction(state: TodoState, input: FocusTodoInput | LegacyFocu
     case "replace": {
       const raw = (input as { items?: unknown }).items
       if (!Array.isArray(raw)) return fail("items must be an array")
-      if (raw.length > MAX_ITEMS) return fail(`too many items (max ${MAX_ITEMS})`)
+      if (raw.length > limits.items) return fail(`too many items (max ${limits.items})`)
 
       const items: TodoItem[] = []
       const used = new Set<string>()
@@ -671,21 +856,26 @@ export function applyAction(state: TodoState, input: FocusTodoInput | LegacyFocu
           inProgress = id
         }
         used.add(id)
-        items.push({ id, text: text.text, status: status.status })
+        items.push({
+          id,
+          text: text.text,
+          status: status.status,
+          ...(status.status === "in_progress" && now !== undefined ? { startedAt: now } : {}),
+        })
       }
 
       // A new plan starts clean: the marked rows and the `done` count both belonged to the
       // plan being replaced, so they go with it. `done` counts completions in the current
       // plan, not the session — nothing accumulates past the plan that produced it.
-      const next = clone(state, capped(items), { nextId, completed: 0 })
+      const next = clone(state, capped(items, limits), { nextId, completed: 0 })
       return { ok: true, state: next, text: formatState(next), write: true }
     }
 
     case "mutate":
-      return applyMutationOps(state, (input as { ops?: unknown }).ops, false, "mutate")
+      return applyMutationOps(state, (input as { ops?: unknown }).ops, false, "mutate", options)
 
     case "add": {
-      if (openItems(state).length >= MAX_ITEMS) return fail(`too many items (max ${MAX_ITEMS})`)
+      if (openItems(state).length >= limits.items) return fail(`too many items (max ${limits.items})`)
       const source = input as { text?: unknown; status?: unknown }
       const text = cleanText(source.text)
       if ("ok" in text) return text
@@ -698,7 +888,13 @@ export function applyAction(state: TodoState, input: FocusTodoInput | LegacyFocu
       const id = `t${state.nextId}`
       // A new item joins the open section, not the end of the array: the marked rows
       // stay last, so the stored order is the same one `formatState` prints.
-      const items = capped([...state.items, { id, text: text.text, status: status.status }])
+      const added: TodoItem = {
+        id,
+        text: text.text,
+        status: status.status,
+        ...(status.status === "in_progress" && now !== undefined ? { startedAt: now } : {}),
+      }
+      const items = capped([...state.items, added], limits)
       const next = clone(state, items, { nextId: state.nextId + 1 })
       return { ok: true, state: next, text: formatState(next), write: true }
     }
@@ -745,13 +941,33 @@ export function applyAction(state: TodoState, input: FocusTodoInput | LegacyFocu
         // edits ride along in the same call, so finishing something renamed on the way
         // is one op, not two.
         const items = capped(
-          state.items.map((item, position) => (position === index ? { ...item, text, status, done: true } : item)),
+          state.items.map((item, position) => {
+            if (position !== index) return item
+            const marked: TodoItem = { ...item, text, status, done: true }
+            delete marked.startedAt
+            return marked
+          }),
+          limits,
         )
         const next = clone(state, items, { completed: state.completed + 1 })
         return { ok: true, state: next, text: formatState(next), write: true }
       }
 
-      const items = state.items.map((item, position) => (position === index ? { ...item, text, status } : item))
+      const items = state.items.map((item, position) => {
+        if (position !== index) return item
+        // Re-entering in_progress starts a fresh timer; renaming a row that is
+        // already running keeps the original start.
+        const startedAt =
+          status === "in_progress"
+            ? current.status === "in_progress" && current.startedAt !== undefined
+              ? current.startedAt
+              : now
+            : undefined
+        const updated: TodoItem = { ...item, text, status }
+        if (startedAt !== undefined) updated.startedAt = startedAt
+        else delete updated.startedAt
+        return updated
+      })
       const next = clone(state, canonical(items))
       return { ok: true, state: next, text: formatState(next), write: true }
     }
@@ -768,13 +984,13 @@ export function applyAction(state: TodoState, input: FocusTodoInput | LegacyFocu
 
     case "batch":
       // Backward compatibility for callers that still send the old envelope.
-      return applyMutationOps(state, (input as { ops?: unknown }).ops, true, "batch")
+      return applyMutationOps(state, (input as { ops?: unknown }).ops, true, "batch", options)
 
     case "complete":
-      return applyAction(state, { action: "update", id: (input as { id: string }).id, done: true })
+      return applyAction(state, { action: "update", id: (input as { id: string }).id, done: true }, options)
 
     case "clear":
-      return applyAction(state, { action: "replace", items: [] })
+      return applyAction(state, { action: "replace", items: [] }, options)
 
     default:
       return fail(`unknown action (use list|replace|mutate)`)
@@ -782,7 +998,13 @@ export function applyAction(state: TodoState, input: FocusTodoInput | LegacyFocu
 }
 
 /** Apply a mutation envelope atomically. `allowReplace` exists only for old `batch` calls. */
-function applyMutationOps(state: TodoState, raw: unknown, allowReplace: boolean, envelope: "mutate" | "batch"): ActionOutcome {
+function applyMutationOps(
+  state: TodoState,
+  raw: unknown,
+  allowReplace: boolean,
+  envelope: "mutate" | "batch",
+  options: ApplyOptions = {},
+): ActionOutcome {
   if (!Array.isArray(raw)) return fail("ops must be an array")
   if (raw.length === 0) return fail("ops is empty")
   if (raw.length > MAX_BATCH_OPS) return fail(`too many ops (max ${MAX_BATCH_OPS})`)
@@ -817,7 +1039,7 @@ function applyMutationOps(state: TodoState, raw: unknown, allowReplace: boolean,
       errors.push(`${label}: unknown op (use add|update|remove)`)
       continue
     }
-    const outcome = applyAction(draft, op as FocusTodoInput | LegacyFocusTodoInput)
+    const outcome = applyAction(draft, op as FocusTodoInput | LegacyFocusTodoInput, options)
     if (!outcome.ok) {
       errors.push(`${label}: ${outcome.error}`)
       continue
@@ -834,6 +1056,11 @@ function applyMutationOps(state: TodoState, raw: unknown, allowReplace: boolean,
 
 export interface FocusTodo {
   run(sessionID: unknown, input: FocusTodoInput | LegacyFocusTodoInput): Promise<string>
+  /**
+   * Same work as `run`, plus the structured state the tool returns in `metadata`.
+   * Throws when the store cannot be read or written, or when the action is rejected.
+   */
+  runDetailed(sessionID: unknown, input: FocusTodoInput | LegacyFocusTodoInput): Promise<{ text: string; meta: FocusMeta }>
   /** Read-only snapshot for the request reminder; never writes, never throws. */
   peek(sessionID: unknown): Promise<TodoState | undefined>
   /** Diagnostic only: how many sessions currently hold an unfinished mutation chain. */
@@ -855,7 +1082,11 @@ function hostLogger(): Logger | undefined {
  * chained so concurrent tool calls cannot lose an update; the chain entry is
  * removed once it settles, so nothing accumulates in memory.
  */
-export function createFocusTodo(storage: Storage, log: Logger | undefined = hostLogger()): FocusTodo {
+export function createFocusTodo(
+  storage: Storage,
+  log: Logger | undefined = hostLogger(),
+  limits: Limits = DEFAULT_LIMITS,
+): FocusTodo {
   const tails = new Map<string, Promise<void>>()
 
   function serialize<T>(key: string, task: () => Promise<T>): Promise<T> {
@@ -872,51 +1103,50 @@ export function createFocusTodo(storage: Storage, log: Logger | undefined = host
     return result
   }
 
-  async function handle(sessionID: unknown, input: FocusTodoInput | LegacyFocusTodoInput): Promise<string> {
+  async function handleDetailed(
+    sessionID: unknown,
+    input: FocusTodoInput | LegacyFocusTodoInput,
+  ): Promise<{ text: string; meta: FocusMeta }> {
     const key = sessionKey(sessionID)
-    if (key === undefined) return "error=invalid session id"
+    if (key === undefined) throw new Error("invalid session id")
 
     return serialize(key, async () => {
       let state: TodoState
       let notice = ""
-      // A failed read leaves us without the stored list. Writing from the empty base would
-      // silently replace whatever is really stored (the whole plan, up to 16 rows) with the
-      // result of this one call, so a mutation is refused instead of persisted.
-      let readable = true
 
+      // A failed read means we do not know what is stored. Never act from an empty
+      // base: writing would silently replace the real plan with this one call. The
+      // host now gets a thrown error (red part) instead of a success-shaped string,
+      // and the sidebar falls back to its last known view.
       try {
-        const stored = normalizeState(await storage.get(key))
+        const stored = normalizeState(await storage.get(key), limits)
         state = stored.state
         if (stored.corrupt) {
           notice = "warn=stored state was unreadable and has been reset\n"
           log?.warn("[focus-todo] discarded unreadable state", { session: sessionID })
         }
       } catch (error) {
-        readable = false
-        state = emptyState()
-        notice = "warn=state store unavailable, list not loaded\n"
         log?.warn("[focus-todo] storage read failed", { session: sessionID, error: String(error) })
+        throw new Error("state store unavailable")
       }
 
-      const outcome = applyAction(state, input)
-      if (!outcome.ok) return `error=${outcome.error}`
+      const outcome = applyAction(state, input, { limits, now: Date.now() })
+      if (!outcome.ok) throw new Error(outcome.error)
 
-      if (outcome.write && !readable) {
-        log?.warn("[focus-todo] write skipped after a failed read", { session: sessionID })
-        return `${notice}error=state store unreadable, nothing was written (the stored list is untouched)`
-      }
-
+      let effective = outcome.state
       if (outcome.write) {
+        const revision = state.revision + 1
+        effective = { ...outcome.state, revision }
         try {
-          await storage.set(key, { ...outcome.state, revision: state.revision + 1 })
+          await storage.set(key, effective)
         } catch (error) {
           log?.warn("[focus-todo] storage write failed", { session: sessionID, error: String(error) })
-          return `${notice}error=state store write failed`
+          throw new Error("state store write failed")
         }
       }
 
       resetNudgeCadence(key)
-      return notice + outcome.text
+      return { text: notice + outcome.text, meta: focusMeta(effective) }
     })
   }
 
@@ -924,14 +1154,19 @@ export function createFocusTodo(storage: Storage, log: Logger | undefined = host
     const key = sessionKey(sessionID)
     if (key === undefined) return undefined
     try {
-      return normalizeState(await storage.get(key)).state
+      return normalizeState(await storage.get(key), limits).state
     } catch {
       // A reminder is an optimisation; a failed read must not disturb anything.
       return undefined
     }
   }
 
-  return { run: handle, peek, pendingSessions: () => tails.size }
+  return {
+    run: async (sessionID, input) => (await handleDetailed(sessionID, input)).text,
+    runDetailed: handleDetailed,
+    peek,
+    pendingSessions: () => tails.size,
+  }
 }
 
 /** Bound on the per-session cadence memo; entries are tiny and evicted oldest-first. */
@@ -1078,22 +1313,26 @@ export async function injectTail(
     // The clause is the user's own wording, used as written (see `reminderBudget`):
     // a long one may push the line past the budget rather than being cut.
     const clause = nudge === "maintain" ? settings.maintenanceNudge : ""
-    // Only an instruction travels in the shell. A bare `[focus_todo] 3 open: …` line read
-    // as something the user typed is still a true statement, and it is what almost every
-    // turn carries — so spending 37 characters of shell on it bought nothing. The
-    // invitation and the maintenance clause do read like an order, so they keep the
-    // host's marker for harness-authored text.
+    // Only an instruction travels in the shell. A bare `[plan] [focus_todo] 3 open: …`
+    // line is still role `user`, but the six-character marker makes its provenance
+    // explicit without the 37-character shell and without relying on a provider
+    // accepting a system message at the end of the request. The marker is charged to
+    // the budget, so the assembled message never exceeds `reminderBudget`.
     const shelled = nudge !== undefined
-    const budget = settings.reminderBudget - clause.length - (shelled ? REMINDER_WRAP_LENGTH : 0)
+    const budget = settings.reminderBudget - clause.length - (shelled ? REMINDER_WRAP_LENGTH : PLAN_PREFIX.length)
     const signature = stateSignature(state)
     // An unchanged list is re-stated in its short form: same anchor, fewer tokens,
     // and no verbatim repeat for the reader to start skimming.
     const unchanged = nudge === undefined && memo?.signature === signature
+    const reminderOptions: ReminderOptions = {
+      now: Date.now(),
+      stalledAfter: settings.stalledAfter,
+    }
     const line =
       nudge === "create"
         ? settings.creationNudge
-        : ((unchanged ? compactReminder(state, budget, settings.itemChars) : undefined) ??
-          formatReminder(state, budget, settings.itemChars))
+        : ((unchanged ? compactReminder(state, budget, settings.itemChars, reminderOptions) : undefined) ??
+          formatReminder(state, budget, settings.itemChars, reminderOptions))
     if (line === undefined) {
       storeMemo(key, { lastTurn: turn, idle: idle + 1, signature, invited })
       return false
@@ -1102,7 +1341,7 @@ export async function injectTail(
     // system prompt says so verbatim ("`<system-reminder>` blocks are harness
     // instructions, not user-authored content. Read and follow them."). It is spent
     // only where it changes how the line reads: an instruction, not a state report.
-    const reminder = shelled ? `${REMINDER_WRAP.open}${line}${clause}${REMINDER_WRAP.close}` : line
+    const reminder = shelled ? `${REMINDER_WRAP.open}${line}${clause}${REMINDER_WRAP.close}` : `${PLAN_PREFIX}${line}`
     messages.push({
       id: `focus-todo-${Date.now().toString(36)}`,
       role: "user",
@@ -1132,11 +1371,12 @@ function isOwnReminderMessage(value: unknown): boolean {
 /** Guards against a double setup (plugin reload) registering two reminders. */
 let reminderHookRegistered = false
 /**
- * Test/teardown hook: forgets the registration guard *and* the per-session
+ * Test/teardown hook: forgets the registration guards *and* the per-session
  * reminder cadence, so each case starts from a fresh process's point of view.
  */
 export function resetHookRegistration(): void {
   reminderHookRegistered = false
+  sessionCleanupRegistered = false
   memos.clear()
 }
 
@@ -1171,6 +1411,121 @@ interface PluginContextV2 {
   session?: {
     hook(name: "context", callback: (payload: unknown) => Promise<void> | void): Promise<unknown> | unknown
   }
+  /**
+   * Host event stream, probed from the v2 binary: `session.deleted` carries
+   * `data.sessionID`. The domain has been seen as both `subscribe` and `listen`
+   * across builds, so either name is accepted.
+   */
+  event?: {
+    subscribe?(callback: (event: unknown) => Promise<void> | void): Promise<unknown> | unknown
+    listen?(callback: (event: unknown) => Promise<void> | void): Promise<unknown> | unknown
+  }
+}
+
+function envOf(): Record<string, string | undefined> {
+  return (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {}
+}
+
+/**
+ * `FOCUS_TODO_DOCTOR=1` prints one line per unpublished host surface this plugin
+ * depends on. Each of them fails silently when it drifts, so the probe exists to
+ * turn "why did reminders stop?" into a five-second read of the log.
+ */
+export function doctorEnabled(env: Record<string, string | undefined> = envOf()): boolean {
+  return env["FOCUS_TODO_DOCTOR"] === "1" || env["FOCUS_TODO_DOCTOR"] === "true"
+}
+
+function doctorLine(log: Logger | undefined, line: string): void {
+  log?.warn(`[focus-todo/doctor] ${line}`)
+}
+
+/** Probes `storage.get` / `storage.set` with a key the plugin owns and never reads elsewhere. */
+async function doctorStorage(storage: Storage | undefined, log: Logger | undefined): Promise<void> {
+  if (!doctorEnabled()) return
+  let getOk = false
+  let setOk = false
+  try {
+    await storage?.get("focus-todo/doctor-probe")
+    getOk = true
+  } catch {}
+  try {
+    await storage?.set("focus-todo/doctor-probe", { at: Date.now() })
+    setOk = true
+  } catch {}
+  const removable = typeof storage?.remove === "function"
+  doctorLine(log, `storage.get=${getOk ? "ok" : "fail"} storage.set=${setOk ? "ok" : "fail"} storage.remove=${removable ? "ok" : "absent"}`)
+}
+
+const SESSION_DELETED_EVENT = "session.deleted"
+let sessionCleanupRegistered = false
+
+type EventCallback = (event: unknown) => Promise<void> | void
+
+/**
+ * Extracts the deleted session id from either envelope the host has shipped:
+ * `{ type, data }` and `{ details: { type, data } }`. `data.sessionID` is the
+ * shape the v2 binary declares; `data.info.id` is accepted as a fallback.
+ */
+export function deletedSessionID(event: unknown): string | undefined {
+  const outer = asRecord(event)
+  if (outer === undefined) return undefined
+  const detail = asRecord(outer["details"]) ?? outer
+  if (detail["type"] !== SESSION_DELETED_EVENT) return undefined
+  const data = asRecord(detail["data"])
+  if (data === undefined) return undefined
+  if (typeof data["sessionID"] === "string") return data["sessionID"]
+  const info = asRecord(data["info"])
+  return typeof info?.["id"] === "string" ? info["id"] : undefined
+}
+
+async function removeSessionState(storage: Storage | undefined, sessionID: unknown, log: Logger | undefined): Promise<void> {
+  const key = sessionKey(sessionID)
+  if (key === undefined) return
+  // The cadence memo only times reminders; letting it outlive the session would
+  // keep a signature around for a list that no longer exists.
+  memos.delete(key)
+  const remove = storage?.remove
+  if (typeof remove !== "function") return
+  try {
+    await remove.call(storage, key)
+  } catch (error) {
+    log?.warn("[focus-todo] deleted session state could not be dropped", { error: String(error) })
+  }
+}
+
+function eventSubscriber(domain: PluginContextV2["event"]): ((callback: EventCallback) => unknown) | undefined {
+  if (domain === undefined) return undefined
+  const subscribe = domain.subscribe
+  if (typeof subscribe === "function") return (callback) => subscribe.call(domain, callback)
+  const listen = domain.listen
+  if (typeof listen === "function") return (callback) => listen.call(domain, callback)
+  return undefined
+}
+
+/**
+ * Deletes the plugin's state row when the host reports a deleted session. This
+ * is independent of the reminder switch: a stale row costs storage whether or
+ * not reminders are on. Registration failure only leaves orphan rows behind.
+ */
+async function registerSessionCleanup(context: PluginContextV2, log: Logger | undefined): Promise<void> {
+  if (sessionCleanupRegistered) return
+  const subscribe = eventSubscriber(context.event)
+  if (subscribe === undefined) {
+    if (doctorEnabled()) doctorLine(log, "event.session.deleted=unavailable")
+    return
+  }
+  try {
+    await subscribe(async (event) => {
+      const sessionID = deletedSessionID(event)
+      if (sessionID !== undefined) await removeSessionState(context.storage, sessionID, log)
+    })
+    // Mark only after the host confirms registration, same rule as the reminder hook.
+    sessionCleanupRegistered = true
+    if (doctorEnabled()) doctorLine(log, "event.session.deleted=ok")
+  } catch (error) {
+    log?.warn("[focus-todo] session cleanup hook not registered", { error: String(error) })
+    if (doctorEnabled()) doctorLine(log, "event.session.deleted=fail")
+  }
 }
 
 /**
@@ -1181,27 +1536,53 @@ export default {
   id: "focus-todo",
   setup: async (context: PluginContextV2) => {
     const log = hostLogger()
-    const todo = createFocusTodo(context.storage, log)
+    // Settings are read once, before the tool is registered: `maxItems` shapes the
+    // input schema, and a schema that changes between setup calls starts a new
+    // cache prefix, so it must be stable for the lifetime of this instance.
+    let settings = DEFAULT_SETTINGS
+    try {
+      settings = await loadSettings()
+    } catch (error) {
+      log?.warn("[focus-todo] settings unavailable, defaults used", { error: String(error) })
+    }
+    const limits = limitsOf(settings)
+    const todo = createFocusTodo(context.storage, log, limits)
+
     try {
       await context.tool.transform((draft) => {
         draft.add({
           name: TOOL_NAME,
           description: TOOL_DESCRIPTION,
-          input: INPUT_SCHEMA,
+          input: inputSchema(limits),
           output: OUTPUT_SCHEMA,
           options: { codemode: false },
-          execute: async (input, tool) => ({ output: await todo.run(tool?.sessionID, input as FocusTodoInput | LegacyFocusTodoInput) }),
+          execute: async (input, tool) => {
+            const result = await todo.runDetailed(tool?.sessionID, input as FocusTodoInput | LegacyFocusTodoInput)
+            // The host persists this on the completed part as `state.metadata.focus` (verified
+            // on the current CLI; older builds wrapped it once more as
+            // `state.metadata.metadata.focus`) and never sends it to the model.
+            return { output: result.text, metadata: { focus: result.meta } }
+          },
         })
       })
+      if (doctorEnabled()) doctorLine(log, "tool.transform=ok codemode=false")
     } catch (error) {
       log?.warn("[focus-todo] setup failed, tool not registered", { error: String(error) })
+      if (doctorEnabled()) doctorLine(log, "tool.transform=fail")
     }
+
+    // The storage probe is independent of the reminder path: it is the only surface
+    // both halves share, so it is checked even when reminders are off.
+    await doctorStorage(context.storage, log)
+
+    // Cleanup is not an optimisation like the reminder: a deleted session must not
+    // leave its state row behind, so this path runs even when reminders are off.
+    await registerSessionCleanup(context, log)
 
     // Optional extra: an attention reminder appended to the request tail. Its
     // failure is contained separately from the tool, because the tool is the
     // contract and the reminder is only an optimisation.
     try {
-      const settings = await loadSettings()
       // With the reminder off the session domain is never even touched.
       if (settings.reminder && !reminderHookRegistered) {
         const register = context.session?.hook
@@ -1217,9 +1598,13 @@ export default {
                 const info = entry as { id?: unknown; mode?: unknown }
                 if (info.mode === "subagent" && typeof info.id === "string") subagents.add(info.id)
               }
+              if (doctorEnabled()) doctorLine(log, `agent.list=ok subagents=${subagents.size}`)
+            } else if (doctorEnabled()) {
+              doctorLine(log, "agent.list=unavailable subagents=0")
             }
           } catch (error) {
             log?.warn("[focus-todo] agent registry unavailable, nudges apply to every agent", { error: String(error) })
+            if (doctorEnabled()) doctorLine(log, "agent.list=fail subagents=0")
           }
           await register.call(context.session, "context", async (payload) => {
             await injectTail(todo, payload, settings, subagents)
@@ -1227,10 +1612,16 @@ export default {
           // Mark only after the host confirms registration. A transient hook failure
           // must not make a later plugin setup permanently inert.
           reminderHookRegistered = true
+          if (doctorEnabled()) doctorLine(log, "session.hook=ok")
+        } else if (doctorEnabled()) {
+          doctorLine(log, "session.hook=unavailable")
         }
+      } else if (doctorEnabled()) {
+        doctorLine(log, `session.hook=skipped (${settings.reminder ? "already registered" : "reminder off"})`)
       }
     } catch (error) {
       log?.warn("[focus-todo] reminder hook not registered, tool unaffected", { error: String(error) })
+      if (doctorEnabled()) doctorLine(log, "session.hook=fail")
     }
   },
 }

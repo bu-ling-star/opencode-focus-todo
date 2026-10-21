@@ -20,6 +20,7 @@ declare module "bun:test" {
     toMatch(pattern: RegExp): void
     readonly not: Matchers
     resolves: { toBeUndefined(): Promise<void> }
+    rejects: { toThrow(expected?: string): Promise<void> }
   }
   export function test(name: string, fn: Fn): void
   export function it(name: string, fn: Fn): void
