@@ -10,8 +10,15 @@ const recs = readFileSync(CAPTURE, "utf8").trim().split("\n").map(JSON.parse)
 const agent = recs.filter((r) => Array.isArray(r.body?.tools) && r.body.tools.length > 0)
 
 const J = (v) => JSON.stringify(v)
-const toolDefs = (r) => J(r.body.tools)
-const toolOrder = (r) => r.body.tools.map((t) => t?.function?.name).join(",")
+const toolName = (t) => t?.function?.name
+const toolOrder = (r) => r.body.tools.map(toolName).join(",")
+// Only focus_todo is this plugin's responsibility: other plugins may register a
+// tool late in a fresh process, so the whole surface is not required to be frozen.
+const focusDef = (r) => J(r.body.tools.find((t) => toolName(t) === "focus_todo"))
+const sharedToolNames = agent
+  .map((r) => r.body.tools.map(toolName))
+  .reduce((shared, names) => shared.filter((name) => names.includes(name)))
+const sharedOrder = (r) => r.body.tools.map(toolName).filter((name) => sharedToolNames.includes(name)).join(",")
 const system = (r) => J(r.body.messages.filter((m) => m.role === "system"))
 const cacheKey = (r) => J(r.body.prompt_cache_key)
 
@@ -33,10 +40,19 @@ const checkIf = (applies, name, ok, detail) => {
   console.log(`N/A   ${name}  -> not applicable to this capture`)
 }
 
-check("every agent request carries the same tool definitions (byte-identical)", new Set(agent.map(toolDefs)).size === 1, `${agent.length} requests, ${new Set(agent.map(toolDefs)).size} distinct`)
-check("every agent request carries the same tool order", new Set(agent.map(toolOrder)).size === 1, toolOrder(agent[0]).split(",").length + " tools")
+check("the focus_todo definition is byte-identical across every agent request", new Set(agent.map(focusDef)).size === 1, `${agent.length} requests, ${new Set(agent.map(focusDef)).size} distinct`)
+check("the relative order of every tool present in all requests is stable", new Set(agent.map(sharedOrder)).size === 1, `${sharedToolNames.length} tools shared by all ${agent.length} requests`)
 check("focus_todo is a first-class wire tool in every agent request", agent.every((r) => toolOrder(r).split(",").includes("focus_todo")))
 check("the system prompt is byte-identical across every agent request", new Set(agent.map(system)).size === 1, `${system(agent[0]).length} bytes`)
+
+// A tool registered by another plugin after this process's first request is
+// reported, not failed: it says nothing about this plugin's wire surface.
+const seenIn = new Map()
+for (const r of agent) for (const name of r.body.tools.map(toolName)) seenIn.set(name, (seenIn.get(name) ?? 0) + 1)
+const unstable = [...seenIn].filter(([, count]) => count !== agent.length)
+if (unstable.length > 0) {
+  console.log(`\nNOTE: tools present in only some agent requests (registered by another plugin): ${unstable.map(([name, count]) => `${name} ${count}/${agent.length}`).join(", ")}`)
+}
 
 let prefixOk = true, prefixDetail = ""
 for (let i = 1; i < agent.length; i += 1) {
